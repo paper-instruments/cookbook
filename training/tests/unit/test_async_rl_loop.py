@@ -74,30 +74,35 @@ class TestConfigDefaults:
 
         assert cfg.pipeline_chunks_per_step == 1
 
-    def test_config_exposes_only_grpo_knobs(self) -> None:
+    def test_config_exposes_cispo_contract(self) -> None:
         cfg = async_rl_loop.Config(log_path="gs://logs")
 
-        assert cfg.kl_beta == 0.001
-        assert cfg.eps_clip == 0.2
-        assert cfg.eps_clip_high is None
-        assert cfg.anchor_logp == "old_policy"
+        assert cfg.kl_beta == 0
+        assert cfg.cispo_clip_low_threshold == 0
+        assert cfg.cispo_clip_high_threshold == 5
         assert cfg.router_replay is True
         assert cfg.router_replay_completion_only is True
         assert not hasattr(cfg, "policy_loss")
         assert not hasattr(cfg, "loss_path")
 
 
-def test_main_has_direct_client_grpo_customization_boundary() -> None:
+def test_main_uses_builtin_cispo_with_old_policy_logprobs() -> None:
     source = inspect.getsource(async_rl_loop.main)
 
-    assert "make_grpo_loss_fn(" in source
-    assert "policy.forward_backward_custom(" in source
-    assert 'cfg.anchor_logp == "old_policy"' in source
-    assert "To switch to built-in PPO or another loss" in source
-    assert "adding dispatch" in source
-    assert "skills/fireworks-training/references/rl-custom-loss.md" in source
+    assert "build_grpo_datums(" in source
+    assert 'policy.forward_backward(\n                    datums,\n                    "cispo"' in source
+    assert 'policy.forward(data, "cross_entropy")' in source
+    assert "forward_backward_custom(" not in source
     assert "build_loss_fn" not in source
     assert "loss_path" not in source
+
+
+def test_main_exposes_recipe_sampler_and_drains_step_metrics() -> None:
+    source = inspect.getsource(async_rl_loop.main)
+
+    assert "sampler=sampler" in source
+    assert "summarize_sampler_metrics(sampler.drain_metrics())" in source
+    assert "submit_version" in async_rl_loop._ROLLOUT_CONTEXT_KWARGS
 
 
 @pytest.mark.parametrize(
@@ -110,7 +115,7 @@ def test_main_has_direct_client_grpo_customization_boundary() -> None:
 def test_main_rejects_unused_reference_trainer_config(trainer) -> None:
     cfg = async_rl_loop.Config(log_path="gs://logs", kl_beta=0, trainer=trainer)
 
-    with pytest.raises(ValueError, match="require kl_beta > 0"):
+    with pytest.raises(ValueError, match="does not provision a reference trainer"):
         async_rl_loop.main(
             cfg,
             rows=[],
@@ -120,23 +125,16 @@ def test_main_rejects_unused_reference_trainer_config(trainer) -> None:
 
 @pytest.mark.parametrize(
     "config_overrides",
-    [{"eps_clip": -0.1}, {"eps_clip_high": -0.1}, {"kl_beta": -0.1}],
+    [
+        {"cispo_clip_low_threshold": -0.1},
+        {"cispo_clip_low_threshold": 1.0, "cispo_clip_high_threshold": 1.0},
+        {"kl_beta": 0.1},
+    ],
 )
-def test_main_rejects_invalid_grpo_config(config_overrides) -> None:
+def test_main_rejects_invalid_cispo_config(config_overrides) -> None:
     cfg = async_rl_loop.Config(log_path="gs://logs", **config_overrides)
 
-    with pytest.raises(ValueError, match="must be non-negative"):
-        async_rl_loop.main(
-            cfg,
-            rows=[],
-            rollout_fn_factory=lambda _setup: lambda _sample: None,
-        )
-
-
-def test_main_rejects_unknown_anchor_logp() -> None:
-    cfg = async_rl_loop.Config(log_path="gs://logs", anchor_logp="unknown")
-
-    with pytest.raises(ValueError, match="anchor_logp must be"):
+    with pytest.raises(ValueError, match="CISPO|cispo"):
         async_rl_loop.main(
             cfg,
             rows=[],

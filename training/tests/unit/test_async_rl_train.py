@@ -77,6 +77,7 @@ def _row(
     *,
     reward: float | None = None,
     run_factory: Callable[[int], Awaitable[RolloutRun | None]] | None = None,
+    on_submitted: Callable[[int], None] | None = None,
     on_resolved: Callable[[str], None] | None = None,
 ) -> RolloutRow:
     if run_factory is None:
@@ -87,6 +88,7 @@ def _row(
     return RolloutRow(
         row_id=row_id,
         run_factory=run_factory,
+        on_submitted=on_submitted,
         on_resolved=on_resolved,
     )
 
@@ -366,6 +368,7 @@ def test_staleness_gate_blocks_refill_until_publish() -> None:
 
     async def scenario() -> None:
         third_submitted = asyncio.Event()
+        submit_versions: dict[int, int] = {}
 
         def make_row(index: int) -> RolloutRow:
             async def factory(_sub_index: int) -> RolloutRun:
@@ -373,7 +376,13 @@ def test_staleness_gate_blocks_refill_until_publish() -> None:
                     third_submitted.set()
                 return _rollout_run(float(index))
 
-            return _row(index, run_factory=factory)
+            return _row(
+                index,
+                run_factory=factory,
+                on_submitted=lambda version: submit_versions.__setitem__(
+                    index, version
+                ),
+            )
 
         telemetry = _telemetry()
         coordinator = _coordinator(
@@ -388,11 +397,13 @@ def test_staleness_gate_blocks_refill_until_publish() -> None:
             await asyncio.sleep(0)
             before = telemetry.snapshot()
             assert before["rows_submitted"] == 2
+            assert submit_versions == {0: 0, 1: 0}
             assert before["staleness_capacity"] == 0
             assert not third_submitted.is_set()
 
             published = coordinator.publish(batch)
             await asyncio.wait_for(third_submitted.wait(), timeout=1.0)
+            assert submit_versions[2] == 1
             assert published.trained_against_version == 0
             assert coordinator.published_version == 1
 

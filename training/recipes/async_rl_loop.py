@@ -36,7 +36,7 @@ import os
 import signal
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable
 
 import tinker
 from fireworks.training.sdk.training_spec import (
@@ -67,15 +67,13 @@ from training.utils import (
 from training.utils.checkpoints import TrainingCheckpoints, validate_warm_start_config
 from training.utils.dataloader import CursorDataLoader
 from training.utils.logging import ASYNC_RL_WANDB_METRIC_STEPS
-from training.utils.rl import PromptGroup
 from training.utils.rl.async_rl import (
     AsyncRLCoordinator,
     AsyncRLTelemetry,
     TrainingChunk,
     RolloutRow,
 )
-from training.utils.rl.grpo import make_grpo_loss_fn, validate_grpo_config
-from training.utils.rl.losses import combine_prompt_groups
+from training.utils.rl.losses import build_grpo_datums, combine_prompt_groups
 from training.utils.rl.router_replay import warn_if_full_sequence_router_replay
 from training.utils.rl.tis import TISConfig
 from training.train_loop import DynamicFilterFn
@@ -106,8 +104,8 @@ class Config:
     lr_scheduler: LRSchedulerSpec = field(default_factory=default_constant_schedule)
     """Per-step LR scheduler spec for managed and local async RL runs."""
 
-    kl_beta: float = 0.001
-    """Reference-KL coefficient. Set to ``0`` to skip reference provisioning."""
+    kl_beta: float = 0.0
+    """Reference KL is unsupported by this CISPO recipe fork and must remain zero."""
     completions_per_prompt: int = 4
     max_completion_tokens: int = 1024
     temperature: float = 1.0
@@ -150,10 +148,9 @@ class Config:
     grad_clip_norm: float = 0.0
     """Max gradient norm for clipping. 0 disables clipping."""
 
-    eps_clip: float = 0.2
-    """Lower/upper PPO clip epsilon used by the client-side GRPO update."""
-    eps_clip_high: float | None = None
-    """Optional asymmetric upper clip epsilon; defaults to ``eps_clip``."""
+    cispo_clip_low_threshold: float = 0.0
+    cispo_clip_high_threshold: float = 5.0
+    """Direct CISPO ratio bounds passed to the Fireworks trainer."""
     pipeline_chunks_per_step: int = 1
     """Scheduler chunk cap per global optimizer batch.
 
@@ -162,14 +159,6 @@ class Config:
     """
     tis: TISConfig = field(default_factory=TISConfig)
     """TIS (Train-Inference IS) weight correction config."""
-    anchor_logp: Literal["old_policy", "rollout"] = "old_policy"
-    """PPO anchor source.
-
-    ``"old_policy"`` snapshots trainer logprobs and applies TIS against the
-    rollout behavior policy. ``"rollout"`` skips that forward, anchors PPO on
-    rollout logprobs, and makes the TIS ratio identity.
-    """
-
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     deployment: DeployConfig = field(default_factory=DeployConfig)
     dcp_save_interval: int = 0
@@ -231,6 +220,7 @@ _ROLLOUT_CONTEXT_KWARGS = frozenset(
         "epoch",
         "rollout_idx",
         "sample_index",
+        "submit_version",
         "end_of_epoch",
         "evaluation",
     }
@@ -309,14 +299,16 @@ def main(
     cfg = config
     if evaluation_interval < 1:
         raise ValueError("evaluation_interval must be >= 1")
-    validate_grpo_config(
-        kl_beta=cfg.kl_beta,
-        eps_clip=cfg.eps_clip,
-        eps_clip_high=cfg.eps_clip_high,
-        reference_training_shape_id=cfg.trainer.reference_training_shape_id,
-        reference_job_id=cfg.trainer.reference_job_id,
-        anchor_logp=cfg.anchor_logp,
-    )
+    if cfg.kl_beta != 0:
+        raise ValueError("async CISPO requires kl_beta=0")
+    if cfg.trainer.reference_training_shape_id or cfg.trainer.reference_job_id:
+        raise ValueError("async CISPO does not provision a reference trainer")
+    if cfg.cispo_clip_low_threshold < 0:
+        raise ValueError("cispo_clip_low_threshold must be non-negative")
+    if cfg.cispo_clip_high_threshold <= cfg.cispo_clip_low_threshold:
+        raise ValueError(
+            "cispo_clip_high_threshold must be greater than cispo_clip_low_threshold"
+        )
     logger.warning(
         "async_rl_loop is EXPERIMENTAL and under active development; "
         "the Config / RolloutSetup API may change. See "
@@ -375,9 +367,10 @@ def main(
             "shuffle": cfg.shuffle,
             "seed": cfg.seed,
             "algorithm": "grpo",
-            "trainer_loss": "client",
+            "trainer_loss": "cispo",
             "kl_beta": cfg.kl_beta,
-            "anchor_logp": cfg.anchor_logp,
+            "cispo_clip_low_threshold": cfg.cispo_clip_low_threshold,
+            "cispo_clip_high_threshold": cfg.cispo_clip_high_threshold,
             "lr": cfg.learning_rate,
             "lr_schedule": lr_scheduler.type,
         },
@@ -419,7 +412,7 @@ def main(
                 if cfg.cleanup_on_exit
                 else None
             ),
-            reference_required=cfg.kl_beta > 0,
+            reference_required=False,
         )
         stack.callback(service.close)
         training_client = service.create_training_client(
@@ -438,20 +431,6 @@ def main(
             job_id=service.trainer_job_id,
             service=service,
         )
-        reference = None
-        if cfg.kl_beta > 0:
-            reference_training_client = service.create_reference_client(
-                policy_client=training_client,
-            )
-            reference = ReconnectableClient.from_training_client(
-                reference_training_client,
-                base_model=cfg.base_model,
-                lora_rank=0,
-                job_id=service.reference_client_job_id,
-                service=service,
-                base_only=True,
-            )
-
         ckpt = TrainingCheckpoints(
             policy,
             service,
@@ -530,6 +509,7 @@ def main(
             model=rollout_model,
             completions_per_prompt=cfg.completions_per_prompt,
             extras=dict(rollout_extras or {}),
+            sampler=sampler,
         )
         rollout_fn = rollout_fn_factory(rollout_setup)
         rollout_context_param_names = _rollout_fn_context_param_names(rollout_fn)
@@ -568,6 +548,8 @@ def main(
                 )
                 source_row_id = row.get("id")
 
+                submitted: dict[str, int] = {}
+
                 def run_one_rollout(
                     sub_index: int,
                     sample_prompt=row,
@@ -582,6 +564,7 @@ def main(
                         "epoch": epoch,
                         "rollout_idx": sub_index,
                         "sample_index": sub_index,
+                        "submit_version": submitted["version"],
                         "end_of_epoch": end_of_epoch,
                         "evaluation": False,
                     }
@@ -598,92 +581,42 @@ def main(
                     row_id=idx,
                     run_factory=run_one_rollout,
                     row_meta={"row_id": source_row_id},
+                    on_submitted=lambda version, submitted=submitted: submitted.__setitem__(
+                        "version", version
+                    ),
                     on_resolved=lambda _reason, idx=idx: row_loader.mark_resolved(idx),
                 )
 
-        def ref_forward(groups: list[PromptGroup]) -> None:
-            if reference is None:
-                return
-            all_ref_data = [d for pg in groups for d in pg.ref_data]
-            ref_fwd = reference.forward(all_ref_data, "cross_entropy")
-            idx = 0
-            for pg in groups:
-                n = len(pg.ref_data)
-                pg.ref_logprobs = [
-                    ref_fwd.loss_fn_outputs[idx + i]["logprobs"].data for i in range(n)
-                ]
-                idx += n
-
-        def fwd_bwd_batch(
-            data,
-            adv,
-            ref_lp,
-            prompt_lens,
-            inf_lp,
-            raw_inf_lp,
-            old_policy_logprobs,
-        ):
-            """Run client-side GRPO with PPO clipping, TIS, and optional reference KL.
-
-            To switch to built-in PPO or another loss, replace this call rather
-            than adding dispatch. See
-            ``skills/fireworks-training/references/rl-custom-loss.md``.
-            """
-            return policy.forward_backward_custom(
-                data,
-                make_grpo_loss_fn(
-                    advantages=adv,
-                    ref_logprobs=ref_lp,
-                    prompt_len=prompt_lens,
-                    inf_logprobs=inf_lp,
-                    old_policy_logprobs=old_policy_logprobs,
-                    kl_beta=cfg.kl_beta,
-                    eps_clip=cfg.eps_clip,
-                    eps_clip_high=cfg.eps_clip_high,
-                    tis_config=cfg.tis,
-                    raw_inf_logprobs=raw_inf_lp,
-                ),
-            )
-
         def train_chunk(chunk: TrainingChunk) -> dict[str, Any]:
-            """Run the visible GRPO forward/backward phase for one chunk."""
+            """Run one built-in CISPO forward/backward chunk."""
 
             prompt_groups = list(chunk.groups)
-            with elapsed_timer("ref_forward"):
-                ref_forward(prompt_groups)
-
-            data, adv, ref_lp, prompt_lens, inf_lp, raw_inf_lp = combine_prompt_groups(
-                prompt_groups,
-                include_raw=True,
+            data, advantages, _, prompt_lens, rollout_logprobs = combine_prompt_groups(
+                prompt_groups
             )
-            if cfg.anchor_logp == "old_policy":
-                with elapsed_timer("old_policy_forward"):
-                    old_policy_fwd = policy.forward(data, "cross_entropy")
-                    old_policy_logprobs = [
-                        old_policy_fwd.loss_fn_outputs[i]["logprobs"].data
-                        for i in range(len(data))
-                    ]
-            else:
-                if len(inf_lp) != len(data):
-                    raise ValueError(
-                        "anchor_logp='rollout' requires one rollout_logprobs "
-                        f"row per datum; got {len(inf_lp)} rows for {len(data)} datums."
-                    )
-                if any(not row for row in inf_lp):
-                    raise ValueError(
-                        "anchor_logp='rollout' requires non-empty rollout_logprobs."
-                    )
-                old_policy_logprobs = inf_lp
+            with elapsed_timer("old_policy_forward"):
+                old_policy_fwd = policy.forward(data, "cross_entropy")
+                old_policy_logprobs = [
+                    old_policy_fwd.loss_fn_outputs[i]["logprobs"].data
+                    for i in range(len(data))
+                ]
+            datums = build_grpo_datums(
+                data,
+                advantages,
+                old_policy_logprobs,
+                rollout_logprobs,
+                prompt_lens,
+                cfg.tis,
+            )
 
             with elapsed_timer("fwd_bwd"):
-                fwd_bwd_result = fwd_bwd_batch(
-                    data,
-                    adv,
-                    ref_lp,
-                    prompt_lens,
-                    inf_lp,
-                    raw_inf_lp,
-                    old_policy_logprobs,
+                fwd_bwd_result = policy.forward_backward(
+                    datums,
+                    "cispo",
+                    loss_fn_config={
+                        "clip_low_threshold": cfg.cispo_clip_low_threshold,
+                        "clip_high_threshold": cfg.cispo_clip_high_threshold,
+                    },
                 )
             return {
                 "prompt_groups": prompt_groups,
@@ -736,7 +669,7 @@ def main(
                 training_chunks_per_step=cfg.pipeline_chunks_per_step,
                 max_head_off_policy_versions=cfg.max_head_offpolicy_versions,
                 max_concurrent_rollouts=cfg.max_concurrency_rollout_sample,
-                with_reference=(reference is not None),
+                with_reference=False,
                 router_replay_completion_only=cfg.router_replay_completion_only,
                 min_group_size=cfg.min_group_size,
                 max_incomplete_group_retries=cfg.max_incomplete_group_retries,
@@ -782,6 +715,14 @@ def main(
                         )
                         published = coordinator.publish(batch)
 
+                        timing_metrics = flush_timing()
+                        summarize_sampler_metrics = rollout_setup.extras.get(
+                            "summarize_sampler_metrics"
+                        )
+                        if summarize_sampler_metrics is not None:
+                            timing_metrics.update(
+                                summarize_sampler_metrics(sampler.drain_metrics())
+                            )
                         telemetry.finish_step(
                             batch=batch,
                             trained_against_version=(published.trained_against_version),
@@ -794,7 +735,7 @@ def main(
                                 output["fwd_bwd_result"] for output in chunk_outputs
                             ],
                             optim_result=optimizer["result"],
-                            timing_metrics=flush_timing(),
+                            timing_metrics=timing_metrics,
                             step_time=published.step_time,
                             weight_update_time=sync_wall_time,
                             learning_rate=optimizer["learning_rate"],

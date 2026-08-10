@@ -47,6 +47,7 @@ class RolloutRow:
     row_id: Hashable
     run_factory: RunFactory
     row_meta: dict[str, Any] | None = None
+    on_submitted: Callable[[int], None] | None = None
     on_resolved: Callable[[str], None] | None = None
 
     def __post_init__(self) -> None:
@@ -58,6 +59,8 @@ class RolloutRow:
             raise TypeError("run_factory must be callable")
         if self.row_meta is not None and not isinstance(self.row_meta, dict):
             raise TypeError("row_meta must be a dict or None")
+        if self.on_submitted is not None and not callable(self.on_submitted):
+            raise TypeError("on_submitted must be callable or None")
         if self.on_resolved is not None and not callable(self.on_resolved):
             raise TypeError("on_resolved must be callable or None")
 
@@ -410,10 +413,13 @@ class RolloutProducer:
 
     def _submit_attempt(self, sequence: int, request: RolloutRow) -> None:
         self._reserved_samples += self._cpp
+        submit_version = self._published_version
+        if request.on_submitted is not None:
+            request.on_submitted(submit_version)
         for sub_index in range(self._cpp):
             self._assembler.note_started(
                 sequence,
-                submit_version=self._published_version,
+                submit_version=submit_version,
                 row_meta=request.row_meta if sub_index == 0 else None,
             )
             task = asyncio.create_task(
