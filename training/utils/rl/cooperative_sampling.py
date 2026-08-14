@@ -9,14 +9,13 @@ loop.
 
 This cookbook-local compatibility boundary keeps the SDK's retry, metrics, and
 response-assembly behavior while changing the sampler's private async client
-to serialize large token prompts in a worker thread, return successful
-responses as live streams, and cooperatively yield between bounded response
-chunks. Remove it once the pinned SDK provides equivalent behavior itself.
+to return successful responses as live streams and cooperatively yield between
+bounded response chunks. Remove it once the pinned SDK provides equivalent
+behavior itself.
 """
 
 from __future__ import annotations
 
-import json as json_lib
 import asyncio
 from typing import Any
 
@@ -76,16 +75,7 @@ class CooperativeSamplingAsyncClient(httpx.AsyncClient):
         self._cooperative_chunk_bytes = cooperative_chunk_bytes
 
     async def post(self, url: Any, **kwargs: Any) -> httpx.Response:
-        """Build a POST request off-loop and send successful responses live."""
-
-        json_body = kwargs.pop("json", None)
-        if json_body is not None:
-            if kwargs.get("content") is not None:
-                raise TypeError("cannot provide both content and json")
-            kwargs["content"] = await asyncio.to_thread(_encode_json, json_body)
-            headers = httpx.Headers(kwargs.get("headers"))
-            headers.setdefault("content-type", "application/json")
-            kwargs["headers"] = headers
+        """Send successful responses as live streams."""
 
         auth = kwargs.pop("auth", httpx.USE_CLIENT_DEFAULT)
         follow_redirects = kwargs.pop(
@@ -131,14 +121,3 @@ def install_cooperative_sampling_transport(sampler: Any) -> None:
             max_keepalive_connections=64,
         ),
     )
-
-
-def _encode_json(value: Any) -> bytes:
-    """Match HTTPX's compact JSON encoding outside the rollout loop."""
-
-    return json_lib.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
