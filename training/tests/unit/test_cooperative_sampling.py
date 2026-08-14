@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import asyncio
+import json
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from fireworks.training.sdk.deployment import DeploymentSampler
 
 from training.utils.rl.cooperative_sampling import (
     _CooperativeByteStream,
+    _CooperativeYieldBudget,
     CooperativeSamplingAsyncClient,
     install_cooperative_sampling_transport,
 )
@@ -26,38 +28,63 @@ class _OneChunkStream(httpx.AsyncByteStream):
         self.closed = True
 
 
-def test_cooperative_stream_yields_between_bounded_chunks() -> None:
-    source = _OneChunkStream(b"x" * 12)
-    stream = _CooperativeByteStream(source, chunk_bytes=4)
+def test_client_shares_byte_budget_across_response_streams() -> None:
+    sources = iter([_OneChunkStream(b"aaaa"), _OneChunkStream(b"bbbb")])
 
-    async def run() -> tuple[list[bytes], int]:
-        ticks = 0
-        finished = asyncio.Event()
+    async def run() -> tuple[list[bytes], list[_OneChunkStream], int]:
+        client = CooperativeSamplingAsyncClient(
+            cooperative_byte_budget=8,
+            cooperative_time_budget_seconds=60,
+        )
+        used_sources: list[_OneChunkStream] = []
 
-        async def consume() -> list[bytes]:
-            chunks = [chunk async for chunk in stream]
-            finished.set()
-            return chunks
+        async def send(request, *, stream, auth, follow_redirects):
+            source = next(sources)
+            used_sources.append(source)
+            return httpx.Response(200, request=request, stream=source)
 
-        async def ticker() -> None:
-            nonlocal ticks
-            while not finished.is_set():
-                ticks += 1
-                await asyncio.sleep(0)
+        client.send = send
+        sleep = AsyncMock()
+        with patch(
+            "training.utils.rl.cooperative_sampling.asyncio.sleep",
+            sleep,
+        ):
+            contents = []
+            for _ in range(2):
+                response = await client.post("https://example.test")
+                contents.append(await response.aread())
+        await client.aclose()
+        return contents, used_sources, sleep.await_count
 
-        chunks, _ = await asyncio.gather(consume(), ticker())
-        return chunks, ticks
+    contents, used_sources, yield_count = asyncio.run(run())
 
-    chunks, ticks = asyncio.run(run())
+    assert contents == [b"aaaa", b"bbbb"]
+    assert yield_count == 1
+    assert all(source.closed for source in used_sources)
 
-    assert chunks == [b"xxxx", b"xxxx", b"xxxx"]
-    assert ticks >= 3
-    assert source.closed
+
+def test_yield_budget_expires_before_byte_limit() -> None:
+    budget = _CooperativeYieldBudget(
+        byte_budget=64 * 1024,
+        time_budget_seconds=0.001,
+    )
+
+    assert not budget.consume(1, now=0.0)
+    assert not budget.consume(1, now=0.0009)
+    assert budget.consume(1, now=0.0011)
+    assert not budget.consume(1, now=0.0012)
 
 
 def test_cooperative_stream_closes_when_consumer_stops_early() -> None:
     source = _OneChunkStream(b"first-second")
-    stream = _CooperativeByteStream(source, chunk_bytes=6)
+    stream = _CooperativeByteStream(
+        source,
+        budget=_CooperativeYieldBudget(
+            byte_budget=6,
+            time_budget_seconds=60,
+        ),
+        chunk_bytes=6,
+    )
 
     async def run() -> None:
         async for chunk in stream:
@@ -146,7 +173,8 @@ def test_deployment_sampler_consumes_cooperative_live_response() -> None:
         )
         client = CooperativeSamplingAsyncClient(
             transport=httpx.MockTransport(handler),
-            cooperative_chunk_bytes=16,
+            cooperative_byte_budget=16,
+            cooperative_time_budget_seconds=60,
         )
         sampler._async_client = client
         try:

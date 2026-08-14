@@ -9,9 +9,9 @@ loop.
 
 This cookbook-local compatibility boundary keeps the SDK's retry, metrics, and
 response-assembly behavior while changing the sampler's private async client
-to return successful responses as live streams and cooperatively yield between
-bounded response chunks. Remove it once the pinned SDK provides equivalent
-behavior itself.
+to return successful responses as live streams and cooperatively yield after a
+bounded amount of response work. Remove it once the pinned SDK provides
+equivalent behavior itself.
 """
 
 from __future__ import annotations
@@ -21,7 +21,37 @@ from typing import Any
 
 import httpx
 
-_COOPERATIVE_CHUNK_BYTES = 64 * 1024
+_COOPERATIVE_BYTE_BUDGET = 64 * 1024
+_COOPERATIVE_TIME_BUDGET_SECONDS = 0.001
+
+
+class _CooperativeYieldBudget:
+    """Share response-processing time fairly across active streams."""
+
+    def __init__(self, *, byte_budget: int, time_budget_seconds: float) -> None:
+        if byte_budget < 1:
+            raise ValueError("byte_budget must be positive")
+        if time_budget_seconds <= 0:
+            raise ValueError("time_budget_seconds must be positive")
+        self._byte_budget = byte_budget
+        self._time_budget_seconds = time_budget_seconds
+        self._bytes_since_yield = 0
+        self._last_yield_at: float | None = None
+
+    def consume(self, byte_count: int, *, now: float) -> bool:
+        if self._last_yield_at is None:
+            self._last_yield_at = now
+        self._bytes_since_yield += byte_count
+        if (
+            self._bytes_since_yield < self._byte_budget
+            and now - self._last_yield_at < self._time_budget_seconds
+        ):
+            return False
+
+        # Reset before yielding so another active stream observes the new budget.
+        self._bytes_since_yield = 0
+        self._last_yield_at = now
+        return True
 
 
 class _CooperativeByteStream(httpx.AsyncByteStream):
@@ -31,23 +61,26 @@ class _CooperativeByteStream(httpx.AsyncByteStream):
         self,
         stream: httpx.AsyncByteStream,
         *,
-        chunk_bytes: int = _COOPERATIVE_CHUNK_BYTES,
+        budget: _CooperativeYieldBudget,
+        chunk_bytes: int,
     ) -> None:
         if chunk_bytes < 1:
             raise ValueError("chunk_bytes must be positive")
         self._stream = stream
+        self._budget = budget
         self._chunk_bytes = chunk_bytes
         self._closed = False
 
     async def __aiter__(self):
+        loop = asyncio.get_running_loop()
         try:
             async for chunk in self._stream:
                 view = memoryview(chunk)
                 for start in range(0, len(view), self._chunk_bytes):
-                    # An async iterator is not automatically a scheduling point
-                    # while its current transport chunk is already buffered.
-                    await asyncio.sleep(0)
-                    yield bytes(view[start : start + self._chunk_bytes])
+                    piece = bytes(view[start : start + self._chunk_bytes])
+                    if self._budget.consume(len(piece), now=loop.time()):
+                        await asyncio.sleep(0)
+                    yield piece
         finally:
             # DeploymentSampler stops at the SSE [DONE] sentinel. Since that
             # can precede network EOF, release the live response stream when
@@ -66,13 +99,16 @@ class CooperativeSamplingAsyncClient(httpx.AsyncClient):
     def __init__(
         self,
         *args: Any,
-        cooperative_chunk_bytes: int = _COOPERATIVE_CHUNK_BYTES,
+        cooperative_byte_budget: int = _COOPERATIVE_BYTE_BUDGET,
+        cooperative_time_budget_seconds: float = _COOPERATIVE_TIME_BUDGET_SECONDS,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        if cooperative_chunk_bytes < 1:
-            raise ValueError("cooperative_chunk_bytes must be positive")
-        self._cooperative_chunk_bytes = cooperative_chunk_bytes
+        self._cooperative_byte_budget = cooperative_byte_budget
+        self._cooperative_yield_budget = _CooperativeYieldBudget(
+            byte_budget=cooperative_byte_budget,
+            time_budget_seconds=cooperative_time_budget_seconds,
+        )
 
     async def post(self, url: Any, **kwargs: Any) -> httpx.Response:
         """Send successful responses as live streams."""
@@ -98,7 +134,8 @@ class CooperativeSamplingAsyncClient(httpx.AsyncClient):
 
         response.stream = _CooperativeByteStream(
             response.stream,
-            chunk_bytes=self._cooperative_chunk_bytes,
+            budget=self._cooperative_yield_budget,
+            chunk_bytes=self._cooperative_byte_budget,
         )
         return response
 
