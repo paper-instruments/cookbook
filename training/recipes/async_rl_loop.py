@@ -75,6 +75,9 @@ from training.utils.rl.async_rl import (
     RolloutRow,
 )
 from training.utils.rl.grpo import make_grpo_loss_fn, validate_grpo_config
+from training.utils.rl.cooperative_sampling import (
+    install_cooperative_sampling_transport,
+)
 from training.utils.rl.losses import combine_prompt_groups
 from training.utils.rl.router_replay import warn_if_full_sequence_router_replay
 from training.utils.rl.tis import TISConfig
@@ -428,6 +431,7 @@ def main(
             lora_alpha=cfg.lora_alpha,
         )
         sampler = service.create_deployment_sampler(tokenizer=tokenizer)
+        install_cooperative_sampling_transport(sampler)
         rollout_model = sampler.model
         log_metrics({"rollout/step": 0}, step=0)
 
