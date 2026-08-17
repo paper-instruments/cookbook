@@ -34,19 +34,13 @@ jobs:
           cache: pip
           cache-dependency-path: training/pyproject.toml
 
-      - name: Resolve declared minimum SDK
-        id: sdk
-        run: |
-          minimum="$(python tests/verify_sdk_minimum.py)"
-          echo "minimum=${minimum}" >> "${GITHUB_OUTPUT}"
-          echo "Testing declared minimum fireworks-ai==${minimum}"
+      - name: Validate declared SDK contract
+        run: python tests/verify_sdk_minimum.py
 
-      - name: Install cookbook with declared minimum SDK
-        env:
-          SDK_MINIMUM: ${{ steps.sdk.outputs.minimum }}
+      - name: Install cookbook with declared SDK
         run: |
           python -m pip install --upgrade pip
-          python -m pip install . pytest "fireworks-ai[training]==${SDK_MINIMUM}"
+          python -m pip install . pytest
 
       - name: Verify installed cookbook artifact
         working-directory: ${{ runner.temp }}

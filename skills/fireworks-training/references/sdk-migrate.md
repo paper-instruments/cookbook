@@ -125,6 +125,7 @@ service = FiretitanServiceClient.from_firetitan_config(
     training_shape_id=..., reference_training_shape_id=...,
     deployment_id=..., cleanup_trainer_on_close=True,
 )
+sampling_client = None
 try:
     training_client = service.create_training_client(base_model, lora_rank=0)
     policy = ReconnectableClient.from_training_client(
@@ -132,9 +133,12 @@ try:
         job_id=service.trainer_job_id, service=service)
     if kl_beta > 0:
         reference_client = service.create_reference_client(base_model, lora_rank=0)
-    sampler = service.create_deployment_sampler(tokenizer=tokenizer)
+    sampling_client = service.create_sampling_client(tokenizer=tokenizer)
+    sampler = sampling_client.deployment_sampler
     # ... train ...
 finally:
+    if sampling_client is not None:
+        sampling_client.close()
     service.close()
 ```
 
