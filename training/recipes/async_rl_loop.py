@@ -128,8 +128,8 @@ class Config:
     """Staleness budget in weight-sync versions; ``0`` is fully on-policy.
     See ``skills/fireworks-training/references/rl-async.md`` (gate semantics)."""
     max_concurrency_rollout_sample: int | None = None
-    """In-flight LLM-call cap (same unit as ``deployment.max_batch_size``);
-    must be ``>= completions_per_prompt`` or the gate stalls."""
+    """In-flight rollout-callback cap; must be ``>= completions_per_prompt``
+    or the gate stalls."""
     min_group_size: int = 1
     """Minimum surviving rollout runs per row to emit a PromptGroup."""
     max_incomplete_group_retries: int = 0
@@ -211,11 +211,10 @@ class RolloutSetup:
     completions_per_prompt: int
     extras: dict[str, Any] = field(default_factory=dict)
     sampler: Any | None = None
-    """Optional prebuilt sampler.
+    """Optional recipe-owned sampling client.
 
-    Serverless recipes use this hook because their sampling route is bound to
-    a training-session snapshot rather than a dedicated deployment URL.
-    Rollout factories should prefer it when present.
+    The recipe uses this hook when the client owns sampling lifecycle or
+    routing state. Rollout factories should prefer it when present.
     """
 
 
@@ -427,7 +426,9 @@ def main(
             lora_rank=cfg.lora_rank,
             lora_alpha=cfg.lora_alpha,
         )
-        sampler = service.create_deployment_sampler(tokenizer=tokenizer)
+        sampling_client = service.create_sampling_client(tokenizer=tokenizer)
+        stack.callback(sampling_client.close)
+        sampler = sampling_client.deployment_sampler
         rollout_model = sampler.model
         log_metrics({"rollout/step": 0}, step=0)
 
@@ -530,6 +531,7 @@ def main(
             model=rollout_model,
             completions_per_prompt=cfg.completions_per_prompt,
             extras=dict(rollout_extras or {}),
+            sampler=sampling_client,
         )
         rollout_fn = rollout_fn_factory(rollout_setup)
         rollout_context_param_names = _rollout_fn_context_param_names(rollout_fn)

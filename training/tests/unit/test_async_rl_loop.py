@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -15,6 +17,10 @@ from training.recipes import async_rl_loop
 
 
 class _StopAfterProvisioning(RuntimeError):
+    pass
+
+
+class _StopAtRolloutFactory(RuntimeError):
     pass
 
 
@@ -241,6 +247,103 @@ def test_main_can_disable_cleanup_on_exit(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert kwargs["cleanup_trainer_on_close"] is False
     assert kwargs["cleanup_deployment_on_close"] is None
+
+
+@pytest.mark.parametrize("factory_raises", [False, True])
+def test_main_owns_one_managed_sampling_client(
+    monkeypatch: pytest.MonkeyPatch,
+    factory_raises: bool,
+) -> None:
+    events: list[str] = []
+    tokenizer = object()
+    deployment_sampler = SimpleNamespace(
+        base_url="https://deployment.test/v1",
+        model="accounts/test/deployments/model",
+    )
+    sampling_client = MagicMock(deployment_sampler=deployment_sampler)
+    sampling_client.close.side_effect = lambda: events.append("sampling_client.close")
+    service = MagicMock(
+        trainer_job_id="trainer-test",
+        reference_client_job_id=None,
+        reference_trainer_job_id=None,
+        deployment_id="deployment-test",
+        max_context_length=131_072,
+    )
+    service.create_training_client.return_value = object()
+    service.create_sampling_client.return_value = sampling_client
+    service.create_deployment_sampler.side_effect = AssertionError(
+        "the managed sampling client must own the sampler"
+    )
+    service.close.side_effect = lambda: events.append("service.close")
+    policy = MagicMock()
+    policy.save_weights_for_sampler.return_value = SimpleNamespace(path="snapshot-test")
+    checkpoints = MagicMock()
+    checkpoints.resume.return_value = None
+    seen_setups: list[async_rl_loop.RolloutSetup] = []
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    replacements = {
+        "setup_wandb": lambda *_args, **_kwargs: None,
+        "wandb_finish": lambda **_kwargs: None,
+        "log_metrics": lambda *_args, **_kwargs: None,
+        "validate_config": lambda *_args, **_kwargs: None,
+        "resolve_router_replay_enabled": lambda **_kwargs: False,
+        "read_api_extra_headers_env": lambda: {},
+        "load_deployment_tokenizer": lambda _deployment: tokenizer,
+        "build_service_client": lambda **_kwargs: service,
+        "TrainingCheckpoints": lambda *_args, **_kwargs: checkpoints,
+    }
+    for name, replacement in replacements.items():
+        monkeypatch.setattr(async_rl_loop, name, replacement)
+    monkeypatch.setattr(
+        async_rl_loop.ReconnectableClient,
+        "from_training_client",
+        lambda *_args, **_kwargs: policy,
+    )
+
+    def rollout_factory(setup):
+        seen_setups.append(setup)
+        if factory_raises:
+            raise _StopAtRolloutFactory
+
+        async def rollout(_sample):
+            return None
+
+        return rollout
+
+    cfg = async_rl_loop.Config(
+        log_path="/tmp/async_rl_test_logs",
+        kl_beta=0,
+        completions_per_prompt=2,
+        router_replay=False,
+        save_final_checkpoint=False,
+        deployment=async_rl_loop.DeployConfig(
+            tokenizer_model="Qwen/Qwen3-1.7B",
+        ),
+    )
+
+    if factory_raises:
+        with pytest.raises(_StopAtRolloutFactory):
+            async_rl_loop.main(
+                cfg,
+                rows=[],
+                rollout_fn_factory=rollout_factory,
+            )
+    else:
+        async_rl_loop.main(
+            cfg,
+            rows=[],
+            rollout_fn_factory=rollout_factory,
+        )
+
+    assert len(seen_setups) == 1
+    assert seen_setups[0].sampler is sampling_client
+    assert seen_setups[0].inference_base_url == deployment_sampler.base_url
+    assert seen_setups[0].model == deployment_sampler.model
+    service.create_sampling_client.assert_called_once_with(tokenizer=tokenizer)
+    service.create_deployment_sampler.assert_not_called()
+    service.hotload_sampler_snapshot.assert_called_once_with("snapshot-test")
+    assert events == ["sampling_client.close", "service.close"]
 
 
 def test_main_requests_trainer_cleanup_for_empty_job_id(

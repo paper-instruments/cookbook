@@ -8,16 +8,15 @@ cd cookbook/training
 
 # Option A: conda
 conda create -n cookbook python=3.12 -y && conda activate cookbook
-python -m pip install --pre -e .
+python -m pip install -e .
 
 # Option B: uv
 uv venv --python 3.12 && source .venv/bin/activate
-uv pip install --pre -e .
+uv pip install -e .
 ```
 
-`--pre` is required — the SDK (`fireworks-ai[training]`) is a
-prerelease. The cookbook declares recipe-only dependencies such as
-`tinker-cookbook` directly in `pyproject.toml`.
+The cookbook pins the exact SDK source required by its recipes in
+`pyproject.toml`, alongside recipe-only dependencies such as `tinker-cookbook`.
 
 ## Credentials
 
@@ -46,22 +45,22 @@ eval-protocol examples.
 ## Dev dependencies (tests, coverage)
 
 ```bash
-uv pip install --pre -e ".[dev]"   # or: python -m pip install --pre -e ".[dev]"
+uv pip install -e ".[dev]"   # or: python -m pip install -e ".[dev]"
 python -m pytest tests/
 ```
 
 ## Upgrading the SDK
 
-The required SDK version is pinned in `training/pyproject.toml`. To upgrade:
+The required SDK source is pinned in `pyproject.toml`. To upgrade:
 
 ```bash
 cd cookbook/training
-uv pip install --pre --upgrade -e .
+uv pip install --upgrade -e .
 ```
 
-Then verify the installed version satisfies the pin:
+Then verify the installed source matches the pin:
 
 ```bash
-grep 'fireworks-ai\[training\]' training/pyproject.toml
-pip show fireworks-ai | grep Version
+grep 'fireworks-ai\[training\]' pyproject.toml
+python tests/verify_sdk_minimum.py --assert-installed
 ```

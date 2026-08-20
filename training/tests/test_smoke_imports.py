@@ -167,6 +167,12 @@ def test_sdk_symbols(module: str, attr: str):
     assert obj is not None, f"{module}.{attr} not found"
 
 
+def test_managed_sampling_client_supports_native_sampling() -> None:
+    from fireworks.training.sdk.client import FiretitanSamplingClient
+
+    assert callable(getattr(FiretitanSamplingClient, "sample_with_prompt_tokens", None))
+
+
 # ── Recipe Config dataclasses instantiate with defaults ─────────────────────
 
 

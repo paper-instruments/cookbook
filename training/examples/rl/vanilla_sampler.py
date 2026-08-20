@@ -10,14 +10,12 @@ from training.recipes.async_rl_loop import RolloutSetup
 
 
 def build_deployment_sampler(setup: RolloutSetup) -> Any:
-    """Return the setup sampler or construct a deployment-backed sampler.
+    """Return the recipe sampler or construct a deployment-backed sampler.
 
     The training recipe assembles the setup once at startup and hands it
-    to the rollout factory; the factory uses this helper to materialize
-    a sampler bound to the inference deployment.  Concurrency is enforced
-    by the async runner in sample (LLM-call) units via
-    ``cfg.max_concurrency_rollout_sample`` -- the same unit the
-    deployment's ``max_batch_size`` gates on.  No HTTP-layer gate.
+    to the rollout factory. ``max_concurrency_rollout_sample`` caps rollout
+    callbacks; the optional sampling concurrency controller separately limits
+    concurrent LLM requests.
     """
     if setup.sampler is not None:
         return setup.sampler

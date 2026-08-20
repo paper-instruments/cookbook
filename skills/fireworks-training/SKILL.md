@@ -308,7 +308,7 @@ other fallback. Never use `PURPOSE_PILOT`; it controls scheduling semantics.
 Confirm:
 
 - `firectl version`, `firectl whoami`, quota, billing readiness, and account;
-- the installed `fireworks-ai[training]` version satisfies
+- the installed `fireworks-ai[training]` source matches
   `training/pyproject.toml` for Training API work;
 - model support and live training shape availability;
 - dataset format, row count, roles, preference schema, labels, leakage, token

@@ -50,10 +50,7 @@ source .venv/bin/activate
 
 # Install this package in editable mode.
 # Dependencies, including the Fireworks training SDK, are pulled from pyproject.toml.
-uv pip install --pre -e .
-
-# If you skip `--pre`, pip may resolve to the stable `0.x` line,
-# which does not include the managed Fireworks training SDK clients.
+uv pip install -e .
 ```
 
 ### 2. Set your credentials

@@ -88,7 +88,10 @@ with `R` surviving runs has `R` rewards and advantages, while its trainer datum
 count is `sum(len(run.segments) for run in runs)` and may exceed `R`.
 
 `RolloutSetup` contains the tokenizer, tokenizer ID, sampling kwargs, inference
-base URL, API key, deployment model, group size, and caller-provided `extras`.
+base URL, API key, deployment model, group size, caller-provided `extras`, and
+the recipe-owned sampling client. The dedicated recipe supplies its managed
+`FiretitanSamplingClient`; custom rollouts should use that client instead of
+constructing or unwrapping another deployment sampler.
 The rollout may optionally declare any of these keyword parameters when it
 needs dataset position context: `cursor_index`, `row_index`, `epoch`,
 `rollout_idx`, `sample_index`, `end_of_epoch`, and `evaluation`. Training calls
