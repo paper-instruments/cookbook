@@ -3,7 +3,6 @@
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -656,19 +655,21 @@ class TestSave:
                 promotable=False,
                 create_time="2099-01-01T00:00:00Z",
             )
-            fw.list_checkpoints.side_effect = [[older, fresh], [older]]
+            fw.list_checkpoints.side_effect = [[older], [older, fresh], [older]]
         else:
             ckpt._save_appear_timeout_s = 0
         on_saved = MagicMock()
         ckpt._on_dataloader_saved = on_saved
 
-        with pytest.raises(DataloaderStatePersistenceError, match="pair saved checkpoint"):
+        with pytest.raises(
+            DataloaderStatePersistenceError, match="pair saved checkpoint"
+        ):
             ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)
 
         assert not os.path.exists(os.path.join(log_dir, DATALOADER_BASE_NAME))
         on_saved.assert_not_called()
 
-    def test_save_resolution_compares_mixed_precision_timestamps_by_value(
+    def test_save_resolution_accepts_new_second_precision_row_in_same_second(
         self, log_dir
     ):
         older_same_second = _row(
@@ -677,13 +678,36 @@ class TestSave:
             promotable=False,
             create_time="2026-04-29T10:00:13Z",
         )
-        ckpt, _, _ = _make(log_dir, fw_rows=[older_same_second])
+        fresh_same_second = _row(
+            "step-new",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:13Z",
+        )
+        ckpt, _, fw = _make(log_dir, fw_rows=[older_same_second])
+        fw._rows.append(fresh_same_second)
+
+        actual = ckpt._resolve_cp_name_after_save(
+            previous_rows=[older_same_second],
+            appear_timeout_s=0.01,
+            stabilize_s=0,
+            poll_s=0.001,
+        )
+
+        assert actual == "step-new"
+
+    def test_save_resolution_does_not_reuse_preexisting_same_second_row(self, log_dir):
+        existing = _row(
+            "step-old",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:13Z",
+        )
+        ckpt, _, _ = _make(log_dir, fw_rows=[existing])
 
         with pytest.raises(RuntimeError, match="waiting for the saved checkpoint"):
             ckpt._resolve_cp_name_after_save(
-                save_started=datetime(
-                    2026, 4, 29, 10, 0, 13, 500_000, tzinfo=timezone.utc
-                ),
+                previous_rows=[existing],
                 appear_timeout_s=0.01,
                 stabilize_s=0,
                 poll_s=0.001,

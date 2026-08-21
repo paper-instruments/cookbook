@@ -38,6 +38,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol
@@ -185,6 +186,16 @@ def _belongs_to_run(short: str, current_run_id: str | None = None) -> bool:
 def _is_resumable_row(row: dict) -> bool:
     ctype = row.get("checkpointType", "") or ""
     return any(ctype.endswith(suffix) for suffix in _RESUMABLE_TYPE_SUFFIXES)
+
+
+def _checkpoint_row_identity(row: dict) -> tuple[str, str, str, str, bool]:
+    return (
+        str(row.get("name") or ""),
+        str(row.get("createTime") or ""),
+        str(row.get("updateTime") or ""),
+        str(row.get("checkpointType") or ""),
+        bool(row.get("promotable")),
+    )
 
 
 def _parse_iso_time(value: str | None) -> datetime | None:
@@ -386,20 +397,21 @@ class TrainingCheckpoints:
 
         t0 = time.time()
         if resumable:
-            # Record save start time so we can wait for the control plane to
-            # reflect a row newer than this save. The trainer may rename to its
-            # internal step counter (caller passes "step-42", service stores
-            # as "step-0") — and resume reads names from the control plane —
-            # so ``dataloader.json`` must be keyed on whatever name ends up as
-            # the newest resumable row (which is exactly what resume will pick).
-            save_started = datetime.now(timezone.utc)
+            previous_rows: list[dict] = []
+            if data_consumed is not None:
+                try:
+                    previous_rows = self._current_resumable_rows()
+                except Exception as error:
+                    raise DataloaderStatePersistenceError(
+                        "Failed to snapshot checkpoints before saving dataloader state"
+                    ) from error
             logger.info("Saving DCP checkpoint '%s'...", name)
             self._client.save_state(name)
             logger.info("DCP checkpoint '%s' saved (%.1fs)", name, time.time() - t0)
             if data_consumed is not None:
                 try:
                     actual_name = self._resolve_cp_name_after_save(
-                        save_started=save_started,
+                        previous_rows=previous_rows,
                         appear_timeout_s=self._save_appear_timeout_s,
                         stabilize_s=self._save_stabilize_s,
                         poll_s=self._save_poll_s,
@@ -605,28 +617,46 @@ class TrainingCheckpoints:
     def _list_checkpoints(self) -> list[dict]:
         return self._fw_client.list_checkpoints(self._trainer_id)
 
+    def _current_resumable_rows(self) -> list[dict]:
+        return [
+            row
+            for row in self._list_checkpoints()
+            if _is_resumable_row(row) and self._row_matches_current_run(row)
+        ]
+
     def _resolve_cp_name_after_save(
         self,
         *,
-        save_started: datetime,
+        previous_rows: list[dict],
         appear_timeout_s: float,
         stabilize_s: float,
         poll_s: float,
     ) -> str:
         """Wait for the save to surface, let the CP state stabilize, then
-        return the short name of the row resume would pick (newest resumable).
+        return the short name of the row created by this save.
 
         The control plane can show a transient row name mid-save before the
         trainer's internal bookkeeping consolidates (e.g. caller writes
         ``step-2`` but the service later collapses it into ``step-0``). Picking
-        the "first new name" would race with that consolidation and store a
-        dataloader key that resume never sees. Instead we mirror
-        :meth:`_latest_resumable` exactly: after a brief stabilization window,
-        pick the newest resumable row.
+        the first changed row would race with that consolidation and store a
+        dataloader key that resume never sees. After a brief stabilization
+        window, require exactly one row identity absent from the pre-save
+        snapshot.
         """
-        def is_fresh(row: dict) -> bool:
-            create_time = _parse_iso_time(row.get("createTime"))
-            return create_time is not None and create_time >= save_started
+        previous = Counter(_checkpoint_row_identity(row) for row in previous_rows)
+
+        def new_rows(rows: list[dict]) -> list[dict]:
+            remaining = previous.copy()
+            added = []
+            for row in rows:
+                if not _is_resumable_row(row) or not self._row_matches_current_run(row):
+                    continue
+                identity = _checkpoint_row_identity(row)
+                if remaining[identity]:
+                    remaining[identity] -= 1
+                else:
+                    added.append(row)
+            return added
 
         deadline = time.time() + appear_timeout_s
         while time.time() < deadline:
@@ -643,13 +673,7 @@ class TrainingCheckpoints:
                 )
                 time.sleep(poll_s)
                 continue
-            surfaced = any(
-                _is_resumable_row(r)
-                and self._row_matches_current_run(r)
-                and is_fresh(r)
-                for r in rows
-            )
-            if surfaced:
+            if new_rows(rows):
                 break
             time.sleep(poll_s)
         else:
@@ -666,17 +690,16 @@ class TrainingCheckpoints:
             raise RuntimeError(
                 "Could not verify the saved checkpoint after stabilization"
             ) from e
-        resumable = [
-            r
-            for r in rows
-            if _is_resumable_row(r)
-            and self._row_matches_current_run(r)
-            and is_fresh(r)
-        ]
-        if not resumable:
+        candidates = new_rows(rows)
+        if not candidates:
             raise RuntimeError("The saved checkpoint disappeared after stabilization")
-        newest = _newest_first(resumable)[0]
-        return self._trainer_logical_name(_short_name(newest["name"]))
+        if len(candidates) != 1:
+            names = sorted(str(row.get("name") or "") for row in candidates)
+            raise RuntimeError(
+                "Could not uniquely identify the saved checkpoint after stabilization: "
+                f"{names}"
+            )
+        return self._trainer_logical_name(_short_name(candidates[0]["name"]))
 
     def _wait_for_promotable_after_save(
         self,
