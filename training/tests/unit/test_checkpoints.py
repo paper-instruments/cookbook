@@ -636,6 +636,27 @@ class TestSave:
 
         assert str(exc_info.value.__cause__) == "disk full"
 
+    def test_unverified_save_does_not_pair_cursor_with_older_checkpoint(
+        self, log_dir
+    ):
+        older = _row(
+            "step-1",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2025-01-01T00:00:00Z",
+        )
+        ckpt, client, _ = _make(log_dir, fw_rows=[older])
+        client.save_state = MagicMock(return_value=MagicMock())
+        ckpt._save_appear_timeout_s = 0
+        on_saved = MagicMock()
+        ckpt._on_dataloader_saved = on_saved
+
+        with pytest.raises(DataloaderStatePersistenceError, match="pair saved checkpoint"):
+            ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)
+
+        assert not os.path.exists(os.path.join(log_dir, DATALOADER_BASE_NAME))
+        on_saved.assert_not_called()
+
     def test_promotable_only_writes_sampler_no_dataloader(self, log_dir):
         ckpt, client, fw = _make(log_dir)
         ckpt.save("step-1", resumable=False, promotable=True)

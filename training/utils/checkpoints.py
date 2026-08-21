@@ -397,13 +397,17 @@ class TrainingCheckpoints:
             self._client.save_state(name)
             logger.info("DCP checkpoint '%s' saved (%.1fs)", name, time.time() - t0)
             if data_consumed is not None:
-                actual_name = self._resolve_cp_name_after_save(
-                    fallback=name,
-                    save_started_iso=t_save_iso,
-                    appear_timeout_s=self._save_appear_timeout_s,
-                    stabilize_s=self._save_stabilize_s,
-                    poll_s=self._save_poll_s,
-                )
+                try:
+                    actual_name = self._resolve_cp_name_after_save(
+                        save_started_iso=t_save_iso,
+                        appear_timeout_s=self._save_appear_timeout_s,
+                        stabilize_s=self._save_stabilize_s,
+                        poll_s=self._save_poll_s,
+                    )
+                except Exception as error:
+                    raise DataloaderStatePersistenceError(
+                        "Failed to pair saved checkpoint with dataloader state"
+                    ) from error
                 self._write_dataloader(actual_name, data_consumed)
                 if actual_name != name:
                     logger.info(
@@ -604,7 +608,6 @@ class TrainingCheckpoints:
     def _resolve_cp_name_after_save(
         self,
         *,
-        fallback: str,
         save_started_iso: str,
         appear_timeout_s: float,
         stabilize_s: float,
@@ -626,16 +629,9 @@ class TrainingCheckpoints:
             try:
                 rows = self._list_checkpoints()
             except AttributeError as e:
-                # Permanent: the control-plane client doesn't implement
-                # ``list_checkpoints`` (e.g. a unit-test fake). Don't burn
-                # the appear_timeout — fall back to the caller name now.
-                logger.warning(
-                    "list_checkpoints not implemented on control-plane client (%s); "
-                    "falling back to caller name %r for dataloader.json.",
-                    e,
-                    fallback,
-                )
-                return fallback
+                raise RuntimeError(
+                    "Control-plane client cannot verify the saved checkpoint"
+                ) from e
             except Exception as e:
                 logger.debug(
                     "list_checkpoints during save-resolution failed: %s; retrying.",
@@ -653,31 +649,24 @@ class TrainingCheckpoints:
                 break
             time.sleep(poll_s)
         else:
-            logger.warning(
-                "Timed out after %.0fs waiting for CP to surface save (>= %s); "
-                "falling back to caller name %r for dataloader.json.",
-                appear_timeout_s,
-                save_started_iso,
-                fallback,
+            raise RuntimeError(
+                "Timed out after "
+                f"{appear_timeout_s:.0f}s waiting for the saved checkpoint to surface"
             )
-            return fallback
 
         time.sleep(stabilize_s)
 
         try:
             rows = self._list_checkpoints()
         except Exception as e:
-            logger.warning(
-                "list_checkpoints after stabilize failed (%s); falling back to %r.",
-                e,
-                fallback,
-            )
-            return fallback
+            raise RuntimeError(
+                "Could not verify the saved checkpoint after stabilization"
+            ) from e
         resumable = [
             r for r in rows if _is_resumable_row(r) and self._row_matches_current_run(r)
         ]
         if not resumable:
-            return fallback
+            raise RuntimeError("The saved checkpoint disappeared after stabilization")
         newest = _newest_first(resumable)[0]
         return self._trainer_logical_name(_short_name(newest["name"]))
 
