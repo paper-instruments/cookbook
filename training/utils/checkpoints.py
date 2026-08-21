@@ -392,14 +392,14 @@ class TrainingCheckpoints:
             # as "step-0") — and resume reads names from the control plane —
             # so ``dataloader.json`` must be keyed on whatever name ends up as
             # the newest resumable row (which is exactly what resume will pick).
-            t_save_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            save_started = datetime.now(timezone.utc)
             logger.info("Saving DCP checkpoint '%s'...", name)
             self._client.save_state(name)
             logger.info("DCP checkpoint '%s' saved (%.1fs)", name, time.time() - t0)
             if data_consumed is not None:
                 try:
                     actual_name = self._resolve_cp_name_after_save(
-                        save_started_iso=t_save_iso,
+                        save_started=save_started,
                         appear_timeout_s=self._save_appear_timeout_s,
                         stabilize_s=self._save_stabilize_s,
                         poll_s=self._save_poll_s,
@@ -608,7 +608,7 @@ class TrainingCheckpoints:
     def _resolve_cp_name_after_save(
         self,
         *,
-        save_started_iso: str,
+        save_started: datetime,
         appear_timeout_s: float,
         stabilize_s: float,
         poll_s: float,
@@ -624,6 +624,10 @@ class TrainingCheckpoints:
         :meth:`_latest_resumable` exactly: after a brief stabilization window,
         pick the newest resumable row.
         """
+        def is_fresh(row: dict) -> bool:
+            create_time = _parse_iso_time(row.get("createTime"))
+            return create_time is not None and create_time >= save_started
+
         deadline = time.time() + appear_timeout_s
         while time.time() < deadline:
             try:
@@ -642,7 +646,7 @@ class TrainingCheckpoints:
             surfaced = any(
                 _is_resumable_row(r)
                 and self._row_matches_current_run(r)
-                and r.get("createTime", "") >= save_started_iso
+                and is_fresh(r)
                 for r in rows
             )
             if surfaced:
@@ -663,7 +667,11 @@ class TrainingCheckpoints:
                 "Could not verify the saved checkpoint after stabilization"
             ) from e
         resumable = [
-            r for r in rows if _is_resumable_row(r) and self._row_matches_current_run(r)
+            r
+            for r in rows
+            if _is_resumable_row(r)
+            and self._row_matches_current_run(r)
+            and is_fresh(r)
         ]
         if not resumable:
             raise RuntimeError("The saved checkpoint disappeared after stabilization")

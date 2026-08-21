@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -636,8 +637,9 @@ class TestSave:
 
         assert str(exc_info.value.__cause__) == "disk full"
 
+    @pytest.mark.parametrize("surface_then_disappear", [False, True])
     def test_unverified_save_does_not_pair_cursor_with_older_checkpoint(
-        self, log_dir
+        self, log_dir, surface_then_disappear
     ):
         older = _row(
             "step-1",
@@ -645,9 +647,18 @@ class TestSave:
             promotable=False,
             create_time="2025-01-01T00:00:00Z",
         )
-        ckpt, client, _ = _make(log_dir, fw_rows=[older])
+        ckpt, client, fw = _make(log_dir, fw_rows=[older])
         client.save_state = MagicMock(return_value=MagicMock())
-        ckpt._save_appear_timeout_s = 0
+        if surface_then_disappear:
+            fresh = _row(
+                "step-1",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2099-01-01T00:00:00Z",
+            )
+            fw.list_checkpoints.side_effect = [[older, fresh], [older]]
+        else:
+            ckpt._save_appear_timeout_s = 0
         on_saved = MagicMock()
         ckpt._on_dataloader_saved = on_saved
 
@@ -656,6 +667,27 @@ class TestSave:
 
         assert not os.path.exists(os.path.join(log_dir, DATALOADER_BASE_NAME))
         on_saved.assert_not_called()
+
+    def test_save_resolution_compares_mixed_precision_timestamps_by_value(
+        self, log_dir
+    ):
+        older_same_second = _row(
+            "step-old",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:13Z",
+        )
+        ckpt, _, _ = _make(log_dir, fw_rows=[older_same_second])
+
+        with pytest.raises(RuntimeError, match="waiting for the saved checkpoint"):
+            ckpt._resolve_cp_name_after_save(
+                save_started=datetime(
+                    2026, 4, 29, 10, 0, 13, 500_000, tzinfo=timezone.utc
+                ),
+                appear_timeout_s=0.01,
+                stabilize_s=0,
+                poll_s=0.001,
+            )
 
     def test_promotable_only_writes_sampler_no_dataloader(self, log_dir):
         ckpt, client, fw = _make(log_dir)
