@@ -835,14 +835,17 @@ class TrainingCheckpoints:
                 raise RuntimeError(f"Corrupt dataloader state in {path}: {e}") from e
             logger.warning("Corrupt %s (%s); treating as empty.", path, e)
             return {}
-        if required and (
+        invalid = (
             not isinstance(data, dict)
             or any(type(value) is not int or value < 0 for value in data.values())
-        ):
-            raise RuntimeError(
-                f"Corrupt dataloader state in {path}: expected non-negative integers"
-            )
-        return {k: int(v) for k, v in data.items()}
+        )
+        if invalid:
+            error = "expected an object of non-negative integers"
+            if required:
+                raise RuntimeError(f"Corrupt dataloader state in {path}: {error}")
+            logger.warning("Corrupt %s (%s); treating as empty.", path, error)
+            return {}
+        return data
 
     def _write_dataloader(self, name: str, data_consumed: int) -> None:
         try:

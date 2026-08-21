@@ -575,6 +575,25 @@ class TestResume:
 
         client.load_state_with_optimizer.assert_not_called()
 
+    def test_optional_cursor_treats_invalid_schema_as_empty(self, log_dir):
+        rows = [
+            _row(
+                "step-10",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-01T00:00:00Z",
+            )
+        ]
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            json.dump({"step-10": "invalid"}, f)
+        ckpt, client, _ = _make(log_dir, fw_rows=rows)
+
+        info = ckpt.resume()
+
+        assert info == ResumeInfo(step=10, data_consumed=0, source_job_id="job-1")
+        client.load_state_with_optimizer.assert_called_once_with("path://self/step-10")
+
 
 # -- save ----------------------------------------------------------------------
 
