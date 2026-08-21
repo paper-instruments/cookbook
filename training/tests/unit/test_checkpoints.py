@@ -9,6 +9,7 @@ import pytest
 
 from training.utils.checkpoints import (
     DATALOADER_BASE_NAME,
+    DataloaderStatePersistenceError,
     ResumeInfo,
     TrainingCheckpoints,
     _logical_name,
@@ -465,11 +466,18 @@ class TestResume:
         assert info == ResumeInfo(step=0, data_consumed=0, source_job_id=None)
         client.load_adapter.assert_called_once_with("hf/adapter")
 
-    def test_list_failure_propagates(self, log_dir):
+    def test_nonrequired_list_failure_preserves_fresh_start_fallback(self, log_dir):
+        ckpt, client, fw = _make(log_dir)
+        fw.list_checkpoints.side_effect = RuntimeError("503 Service Unavailable")
+
+        assert ckpt.resume() is None
+        client.load_state_with_optimizer.assert_not_called()
+
+    def test_required_list_failure_propagates(self, log_dir):
         ckpt, client, fw = _make(log_dir)
         fw.list_checkpoints.side_effect = RuntimeError("503 Service Unavailable")
         with pytest.raises(RuntimeError, match="503 Service Unavailable"):
-            ckpt.resume()
+            ckpt.resume(require_dataloader_state=True)
         client.load_state_with_optimizer.assert_not_called()
 
     def test_required_cursor_uses_newest_paired_checkpoint(self, log_dir):
@@ -523,6 +531,17 @@ class TestResume:
 
         client.load_state_with_optimizer.assert_not_called()
 
+    def test_required_cursor_rejects_corrupt_dataloader_state(self, log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            f.write("not-json")
+        ckpt, client, _ = _make(log_dir, fw_rows=[])
+
+        with pytest.raises(RuntimeError, match="Corrupt dataloader state"):
+            ckpt.resume(require_dataloader_state=True)
+
+        client.load_state_with_optimizer.assert_not_called()
+
 
 # -- save ----------------------------------------------------------------------
 
@@ -546,8 +565,10 @@ class TestSave:
 
         ckpt, _, _ = _make(log_dir, on_dataloader_saved=after_write)
 
-        with pytest.raises(RuntimeError, match="commit failed"):
+        with pytest.raises(DataloaderStatePersistenceError) as exc_info:
             ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)
+
+        assert str(exc_info.value.__cause__) == "commit failed"
 
     def test_promotable_only_writes_sampler_no_dataloader(self, log_dir):
         ckpt, client, fw = _make(log_dir)

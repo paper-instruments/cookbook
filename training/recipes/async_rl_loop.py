@@ -64,7 +64,11 @@ from training.utils import (
     validate_config,
     wandb_finish,
 )
-from training.utils.checkpoints import TrainingCheckpoints, validate_warm_start_config
+from training.utils.checkpoints import (
+    DataloaderStatePersistenceError,
+    TrainingCheckpoints,
+    validate_warm_start_config,
+)
 from training.utils.dataloader import CursorDataLoader
 from training.utils.logging import ASYNC_RL_WANDB_METRIC_STEPS
 from training.utils.rl import PromptGroup
@@ -829,6 +833,8 @@ def main(
                                     },
                                     step=batch.batch_id,
                                 )
+                            except DataloaderStatePersistenceError:
+                                raise
                             except (OSError, RuntimeError) as error:
                                 logger.warning(
                                     "[step %d] dcp_save failed: %s",

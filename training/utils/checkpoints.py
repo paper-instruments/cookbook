@@ -70,6 +70,10 @@ class ResumeInfo:
     source_job_id: str | None = None
 
 
+class DataloaderStatePersistenceError(RuntimeError):
+    """Raised when checkpoint cursor state cannot be made durable."""
+
+
 class _CheckpointLister(Protocol):
     def list_checkpoints(self, job_id: str, *, page_size: int = 200) -> list[dict]: ...
 
@@ -720,16 +724,26 @@ class TrainingCheckpoints:
     def _latest_resumable(
         self, *, require_dataloader_state: bool = False
     ) -> dict | None:
-        rows = [
-            r
-            for r in self._list_checkpoints()
-            if _is_resumable_row(r) and self._row_matches_current_run(r)
-        ]
+        try:
+            rows = [
+                r
+                for r in self._list_checkpoints()
+                if _is_resumable_row(r) and self._row_matches_current_run(r)
+            ]
+        except Exception as error:
+            if require_dataloader_state:
+                raise
+            logger.warning(
+                "Control-plane list_checkpoints failed (%s); treating as fresh start. "
+                "Override with init_from_checkpoint if this is wrong.",
+                error,
+            )
+            return None
         rows = _newest_first(rows)
         if not require_dataloader_state:
             return rows[0] if rows else None
 
-        dataloader = self._read_all_dataloader()
+        dataloader = self._read_all_dataloader(required=True)
         if not rows:
             if dataloader:
                 raise RuntimeError(
@@ -802,7 +816,7 @@ class TrainingCheckpoints:
     def _dataloader_path(self) -> str:
         return fileio.join(self._log_path, DATALOADER_BASE_NAME)
 
-    def _read_all_dataloader(self) -> dict[str, int]:
+    def _read_all_dataloader(self, *, required: bool = False) -> dict[str, int]:
         path = self._dataloader_path()
         raw = fileio.read_text(path)
         if not raw:
@@ -810,6 +824,8 @@ class TrainingCheckpoints:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
+            if required:
+                raise RuntimeError(f"Corrupt dataloader state in {path}: {e}") from e
             logger.warning("Corrupt %s (%s); treating as empty.", path, e)
             return {}
         return {k: int(v) for k, v in data.items()}
@@ -823,10 +839,15 @@ class TrainingCheckpoints:
         fileio.makedirs(self._log_path)
         fileio.write_json(self._dataloader_path(), data)
         if self._on_dataloader_saved is not None:
-            self._on_dataloader_saved()
+            try:
+                self._on_dataloader_saved()
+            except Exception as error:
+                raise DataloaderStatePersistenceError(
+                    f"Failed to persist dataloader state in {self._dataloader_path()}"
+                ) from error
 
     def _read_dataloader(self, name: str, *, required: bool = False) -> int:
-        data = self._read_all_dataloader()
+        data = self._read_all_dataloader(required=required)
         if required and name not in data:
             raise RuntimeError(
                 f"Checkpoint {name!r} has no matching dataloader state in "
