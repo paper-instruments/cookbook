@@ -95,6 +95,7 @@ def _make(
     save_state_renames_to: str | None = None,
     serverless=False,
     current_run_id: str | None = None,
+    on_dataloader_saved=None,
 ):
     fw = _mock_fw_client(rows=fw_rows)
     client = _mock_client(fw=fw, save_state_renames_to=save_state_renames_to)
@@ -110,6 +111,7 @@ def _make(
         save_stabilize_s=0.0,
         save_poll_s=0.01,
         current_run_id=current_run_id,
+        on_dataloader_saved=on_dataloader_saved,
     )
     return ckpt, client, fw
 
@@ -324,6 +326,18 @@ class TestResume:
         client.resolve_checkpoint_path.assert_called_once_with("step-3")
         client.load_state_with_optimizer.assert_called_once_with("path://self/step-3")
 
+    def test_same_trainer_required_cursor_fails_before_state_load(self, log_dir):
+        ckpt, client, _ = _make(log_dir, fw_rows=[])
+
+        with pytest.raises(RuntimeError, match="no matching dataloader state"):
+            ckpt.resume(
+                init_from_checkpoint="job-1:step-3",
+                require_dataloader_state=True,
+            )
+
+        client.resolve_checkpoint_path.assert_not_called()
+        client.load_state_with_optimizer.assert_not_called()
+
     def test_dedicated_bare_checkpoint_preserves_initialization_semantics(
         self, log_dir
     ):
@@ -451,11 +465,62 @@ class TestResume:
         assert info == ResumeInfo(step=0, data_consumed=0, source_job_id=None)
         client.load_adapter.assert_called_once_with("hf/adapter")
 
-    def test_list_failure_treated_as_fresh_start(self, log_dir):
+    def test_list_failure_propagates(self, log_dir):
         ckpt, client, fw = _make(log_dir)
         fw.list_checkpoints.side_effect = RuntimeError("503 Service Unavailable")
-        info = ckpt.resume()
-        assert info is None
+        with pytest.raises(RuntimeError, match="503 Service Unavailable"):
+            ckpt.resume()
+        client.load_state_with_optimizer.assert_not_called()
+
+    def test_required_cursor_uses_newest_paired_checkpoint(self, log_dir):
+        rows = [
+            _row(
+                "step-10",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-01T00:00:00Z",
+            ),
+            _row(
+                "step-20",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-02T00:00:00Z",
+            ),
+        ]
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            json.dump({"step-10": 80}, f)
+
+        ckpt, client, _ = _make(log_dir, fw_rows=rows)
+        info = ckpt.resume(require_dataloader_state=True)
+
+        assert info == ResumeInfo(step=10, data_consumed=80, source_job_id="job-1")
+        client.load_state_with_optimizer.assert_called_once_with("path://self/step-10")
+
+    def test_required_cursor_rejects_unpaired_checkpoints(self, log_dir):
+        rows = [
+            _row(
+                "step-20",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-02T00:00:00Z",
+            ),
+        ]
+        ckpt, client, _ = _make(log_dir, fw_rows=rows)
+
+        with pytest.raises(RuntimeError, match="none has matching dataloader state"):
+            ckpt.resume(require_dataloader_state=True)
+
+        client.load_state_with_optimizer.assert_not_called()
+
+    def test_required_cursor_rejects_orphaned_dataloader_state(self, log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            json.dump({"step-10": 80}, f)
+        ckpt, client, _ = _make(log_dir, fw_rows=[])
+
+        with pytest.raises(RuntimeError, match="trainer has no resumable checkpoints"):
+            ckpt.resume(require_dataloader_state=True)
+
         client.load_state_with_optimizer.assert_not_called()
 
 
@@ -472,6 +537,17 @@ class TestSave:
 
         with open(os.path.join(log_dir, DATALOADER_BASE_NAME)) as f:
             assert json.load(f) == {"step-1": 100}
+
+    def test_dataloader_callback_observes_write_and_propagates_failure(self, log_dir):
+        def after_write():
+            with open(os.path.join(log_dir, DATALOADER_BASE_NAME)) as f:
+                assert json.load(f) == {"step-1": 100}
+            raise RuntimeError("commit failed")
+
+        ckpt, _, _ = _make(log_dir, on_dataloader_saved=after_write)
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)
 
     def test_promotable_only_writes_sampler_no_dataloader(self, log_dir):
         ckpt, client, fw = _make(log_dir)

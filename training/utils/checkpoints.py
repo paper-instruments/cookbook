@@ -40,7 +40,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import training.utils.fileio as fileio
 
@@ -333,6 +333,7 @@ class TrainingCheckpoints:
         save_stabilize_s: float = 15.0,
         save_poll_s: float = 3.0,
         current_run_id: str | None = None,
+        on_dataloader_saved: Callable[[], None] | None = None,
     ) -> None:
         self._client = client
         self._fw_client = fw_client
@@ -346,6 +347,7 @@ class TrainingCheckpoints:
         self._save_appear_timeout_s = save_appear_timeout_s
         self._save_stabilize_s = save_stabilize_s
         self._save_poll_s = save_poll_s
+        self._on_dataloader_saved = on_dataloader_saved
 
     # -- Save --------------------------------------------------------------
 
@@ -437,6 +439,7 @@ class TrainingCheckpoints:
         *,
         init_from_checkpoint: str | None = None,
         warm_start_from_adapter: str | None = None,
+        require_dataloader_state: bool = False,
     ) -> ResumeInfo | None:
         """Determine resume state and load weights into the live client.
 
@@ -463,6 +466,10 @@ class TrainingCheckpoints:
                 trainer_id=self._trainer_id,
             )
             if ref.restore_recipe_state:
+                data_consumed = self._read_dataloader(
+                    ref.checkpoint_name,
+                    required=require_dataloader_state,
+                )
                 path = self._client.resolve_checkpoint_path(ref.checkpoint_name)
                 logger.info(
                     "Resuming from explicit same-trainer checkpoint: %s",
@@ -473,7 +480,7 @@ class TrainingCheckpoints:
                 logger.info("Checkpoint loaded: %s (%.1fs)", path, time.time() - t0)
                 return ResumeInfo(
                     step=_step_from_name(ref.checkpoint_name),
-                    data_consumed=self._read_dataloader(ref.checkpoint_name),
+                    data_consumed=data_consumed,
                     source_job_id=None if self._serverless else self._trainer_id,
                 )
             path = self._client.resolve_checkpoint_path(
@@ -494,7 +501,9 @@ class TrainingCheckpoints:
                 source_job_id=ref.source_job_id,
             )
 
-        latest = self._latest_resumable()
+        latest = self._latest_resumable(
+            require_dataloader_state=require_dataloader_state
+        )
         if latest:
             short = _short_name(latest["name"])
             logical = self._trainer_logical_name(short)
@@ -513,7 +522,10 @@ class TrainingCheckpoints:
             logger.info("Checkpoint loaded: %s (%.1fs)", path, time.time() - t0)
             return ResumeInfo(
                 step=_step_from_name(logical),
-                data_consumed=self._read_dataloader(logical),
+                data_consumed=self._read_dataloader(
+                    logical,
+                    required=require_dataloader_state,
+                ),
                 source_job_id=None if self._serverless else self._trainer_id,
             )
 
@@ -705,22 +717,34 @@ class TrainingCheckpoints:
         )
         return None
 
-    def _latest_resumable(self) -> dict | None:
-        try:
-            rows = [
-                r
-                for r in self._list_checkpoints()
-                if _is_resumable_row(r) and self._row_matches_current_run(r)
-            ]
-        except Exception as e:
-            logger.warning(
-                "Control-plane list_checkpoints failed (%s); treating as fresh start. "
-                "Override with init_from_checkpoint if this is wrong.",
-                e,
-            )
-            return None
+    def _latest_resumable(
+        self, *, require_dataloader_state: bool = False
+    ) -> dict | None:
+        rows = [
+            r
+            for r in self._list_checkpoints()
+            if _is_resumable_row(r) and self._row_matches_current_run(r)
+        ]
         rows = _newest_first(rows)
-        return rows[0] if rows else None
+        if not require_dataloader_state:
+            return rows[0] if rows else None
+
+        dataloader = self._read_all_dataloader()
+        if not rows:
+            if dataloader:
+                raise RuntimeError(
+                    "Dataloader state exists, but the trainer has no resumable "
+                    "checkpoints"
+                )
+            return None
+        for row in rows:
+            logical = self._trainer_logical_name(_short_name(row["name"]))
+            if logical in dataloader:
+                return row
+        raise RuntimeError(
+            "Resumable checkpoints exist, but none has matching dataloader state "
+            f"in {self._dataloader_path()}"
+        )
 
     def _row_matches_current_run(self, row: dict) -> bool:
         if not self._serverless:
@@ -798,9 +822,17 @@ class TrainingCheckpoints:
             data = dict(ordered[-DATALOADER_HISTORY_KEEP:])
         fileio.makedirs(self._log_path)
         fileio.write_json(self._dataloader_path(), data)
+        if self._on_dataloader_saved is not None:
+            self._on_dataloader_saved()
 
-    def _read_dataloader(self, name: str) -> int:
-        return self._read_all_dataloader().get(name, 0)
+    def _read_dataloader(self, name: str, *, required: bool = False) -> int:
+        data = self._read_all_dataloader()
+        if required and name not in data:
+            raise RuntimeError(
+                f"Checkpoint {name!r} has no matching dataloader state in "
+                f"{self._dataloader_path()}"
+            )
+        return data.get(name, 0)
 
 
 def _step_from_name(name: str) -> int:

@@ -294,6 +294,7 @@ def main(
     evaluation_interval: int = 1,
     rows: list[dict] | None = None,
     rollout_extras: dict[str, Any] | None = None,
+    on_dataloader_saved: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Run the async RL loop with a user-supplied rollout factory.
 
@@ -459,11 +460,13 @@ def main(
             trainer_id=service.trainer_job_id,
             log_path=cfg.log_path,
             lora_rank=cfg.lora_rank,
+            on_dataloader_saved=on_dataloader_saved,
         )
 
         resume_info = ckpt.resume(
             init_from_checkpoint=cfg.init_from_checkpoint,
             warm_start_from_adapter=cfg.warm_start_from_adapter,
+            require_dataloader_state=True,
         )
         step_offset = resume_info.step if resume_info else 0
         if step_offset:

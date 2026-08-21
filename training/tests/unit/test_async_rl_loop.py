@@ -279,6 +279,7 @@ def test_main_owns_one_managed_sampling_client(
     policy.save_weights_for_sampler.return_value = SimpleNamespace(path="snapshot-test")
     checkpoints = MagicMock()
     checkpoints.resume.return_value = None
+    checkpoint_kwargs = {}
     seen_setups: list[async_rl_loop.RolloutSetup] = []
 
     monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
@@ -291,7 +292,9 @@ def test_main_owns_one_managed_sampling_client(
         "read_api_extra_headers_env": lambda: {},
         "load_deployment_tokenizer": lambda _deployment: tokenizer,
         "build_service_client": lambda **_kwargs: service,
-        "TrainingCheckpoints": lambda *_args, **_kwargs: checkpoints,
+        "TrainingCheckpoints": lambda *_args, **kwargs: (
+            checkpoint_kwargs.update(kwargs) or checkpoints
+        ),
     }
     for name, replacement in replacements.items():
         monkeypatch.setattr(async_rl_loop, name, replacement)
@@ -322,18 +325,21 @@ def test_main_owns_one_managed_sampling_client(
         ),
     )
 
+    on_dataloader_saved = MagicMock()
     if factory_raises:
         with pytest.raises(_StopAtRolloutFactory):
             async_rl_loop.main(
                 cfg,
                 rows=[],
                 rollout_fn_factory=rollout_factory,
+                on_dataloader_saved=on_dataloader_saved,
             )
     else:
         async_rl_loop.main(
             cfg,
             rows=[],
             rollout_fn_factory=rollout_factory,
+            on_dataloader_saved=on_dataloader_saved,
         )
 
     assert len(seen_setups) == 1
@@ -343,6 +349,12 @@ def test_main_owns_one_managed_sampling_client(
     service.create_sampling_client.assert_called_once_with(tokenizer=tokenizer)
     service.create_deployment_sampler.assert_not_called()
     service.hotload_sampler_snapshot.assert_called_once_with("snapshot-test")
+    assert checkpoint_kwargs["on_dataloader_saved"] is on_dataloader_saved
+    checkpoints.resume.assert_called_once_with(
+        init_from_checkpoint=None,
+        warm_start_from_adapter=None,
+        require_dataloader_state=True,
+    )
     assert events == ["sampling_client.close", "service.close"]
 
 
