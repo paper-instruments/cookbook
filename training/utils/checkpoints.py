@@ -74,6 +74,12 @@ class DataloaderStatePersistenceError(RuntimeError):
     """Raised when checkpoint cursor state cannot be made durable."""
 
 
+@dataclass(frozen=True)
+class _ResumeCandidate:
+    row: dict
+    data_consumed: int | None
+
+
 class _CheckpointLister(Protocol):
     def list_checkpoints(self, job_id: str, *, page_size: int = 200) -> list[dict]: ...
 
@@ -505,12 +511,16 @@ class TrainingCheckpoints:
                 source_job_id=ref.source_job_id,
             )
 
-        latest = self._latest_resumable(
+        candidate = self._latest_resumable(
             require_dataloader_state=require_dataloader_state
         )
-        if latest:
+        if candidate:
+            latest = candidate.row
             short = _short_name(latest["name"])
             logical = self._trainer_logical_name(short)
+            data_consumed = candidate.data_consumed
+            if data_consumed is None:
+                data_consumed = self._read_dataloader(logical)
             # In serverless mode the pooled multi-session trainer namespaces
             # checkpoints under the current run/session itself and rejects a
             # cross_job://<session_id>/<name> ref (session_id is not a source
@@ -526,10 +536,7 @@ class TrainingCheckpoints:
             logger.info("Checkpoint loaded: %s (%.1fs)", path, time.time() - t0)
             return ResumeInfo(
                 step=_step_from_name(logical),
-                data_consumed=self._read_dataloader(
-                    logical,
-                    required=require_dataloader_state,
-                ),
+                data_consumed=data_consumed,
                 source_job_id=None if self._serverless else self._trainer_id,
             )
 
@@ -723,7 +730,7 @@ class TrainingCheckpoints:
 
     def _latest_resumable(
         self, *, require_dataloader_state: bool = False
-    ) -> dict | None:
+    ) -> _ResumeCandidate | None:
         try:
             rows = [
                 r
@@ -741,7 +748,7 @@ class TrainingCheckpoints:
             return None
         rows = _newest_first(rows)
         if not require_dataloader_state:
-            return rows[0] if rows else None
+            return _ResumeCandidate(rows[0], None) if rows else None
 
         dataloader = self._read_all_dataloader(required=True)
         if not rows:
@@ -754,7 +761,7 @@ class TrainingCheckpoints:
         for row in rows:
             logical = self._trainer_logical_name(_short_name(row["name"]))
             if logical in dataloader:
-                return row
+                return _ResumeCandidate(row, dataloader[logical])
         raise RuntimeError(
             "Resumable checkpoints exist, but none has matching dataloader state "
             f"in {self._dataloader_path()}"
@@ -828,23 +835,32 @@ class TrainingCheckpoints:
                 raise RuntimeError(f"Corrupt dataloader state in {path}: {e}") from e
             logger.warning("Corrupt %s (%s); treating as empty.", path, e)
             return {}
+        if required and (
+            not isinstance(data, dict)
+            or any(type(value) is not int or value < 0 for value in data.values())
+        ):
+            raise RuntimeError(
+                f"Corrupt dataloader state in {path}: expected non-negative integers"
+            )
         return {k: int(v) for k, v in data.items()}
 
     def _write_dataloader(self, name: str, data_consumed: int) -> None:
-        data = self._read_all_dataloader()
-        data[name] = data_consumed
-        if len(data) > DATALOADER_HISTORY_KEEP:
-            ordered = sorted(data.items(), key=lambda kv: _step_from_name(kv[0]))
-            data = dict(ordered[-DATALOADER_HISTORY_KEEP:])
-        fileio.makedirs(self._log_path)
-        fileio.write_json(self._dataloader_path(), data)
-        if self._on_dataloader_saved is not None:
-            try:
+        try:
+            data = self._read_all_dataloader(required=True)
+            data[name] = data_consumed
+            if len(data) > DATALOADER_HISTORY_KEEP:
+                ordered = sorted(data.items(), key=lambda kv: _step_from_name(kv[0]))
+                data = dict(ordered[-DATALOADER_HISTORY_KEEP:])
+            fileio.makedirs(self._log_path)
+            fileio.write_json(self._dataloader_path(), data)
+            if self._on_dataloader_saved is not None:
                 self._on_dataloader_saved()
-            except Exception as error:
-                raise DataloaderStatePersistenceError(
-                    f"Failed to persist dataloader state in {self._dataloader_path()}"
-                ) from error
+        except DataloaderStatePersistenceError:
+            raise
+        except Exception as error:
+            raise DataloaderStatePersistenceError(
+                f"Failed to persist dataloader state in {self._dataloader_path()}"
+            ) from error
 
     def _read_dataloader(self, name: str, *, required: bool = False) -> int:
         data = self._read_all_dataloader(required=required)

@@ -480,7 +480,9 @@ class TestResume:
             ckpt.resume(require_dataloader_state=True)
         client.load_state_with_optimizer.assert_not_called()
 
-    def test_required_cursor_uses_newest_paired_checkpoint(self, log_dir):
+    def test_required_cursor_uses_one_snapshot_for_selection_and_load(
+        self, log_dir, monkeypatch
+    ):
         rows = [
             _row(
                 "step-10",
@@ -499,10 +501,13 @@ class TestResume:
             json.dump({"step-10": 80}, f)
 
         ckpt, client, _ = _make(log_dir, fw_rows=rows)
+        read_dataloader = MagicMock(return_value={"step-10": 80})
+        monkeypatch.setattr(ckpt, "_read_all_dataloader", read_dataloader)
         info = ckpt.resume(require_dataloader_state=True)
 
         assert info == ResumeInfo(step=10, data_consumed=80, source_job_id="job-1")
         client.load_state_with_optimizer.assert_called_once_with("path://self/step-10")
+        read_dataloader.assert_called_once_with(required=True)
 
     def test_required_cursor_rejects_unpaired_checkpoints(self, log_dir):
         rows = [
@@ -542,6 +547,34 @@ class TestResume:
 
         client.load_state_with_optimizer.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "state",
+        [
+            {"step-10": 3.9},
+            {"step-10": True},
+            {"step-10": -1},
+            [],
+        ],
+    )
+    def test_required_cursor_rejects_invalid_schema(self, log_dir, state):
+        rows = [
+            _row(
+                "step-10",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-01T00:00:00Z",
+            )
+        ]
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            json.dump(state, f)
+        ckpt, client, _ = _make(log_dir, fw_rows=rows)
+
+        with pytest.raises(RuntimeError, match="Corrupt dataloader state"):
+            ckpt.resume(require_dataloader_state=True)
+
+        client.load_state_with_optimizer.assert_not_called()
+
 
 # -- save ----------------------------------------------------------------------
 
@@ -569,6 +602,20 @@ class TestSave:
             ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)
 
         assert str(exc_info.value.__cause__) == "commit failed"
+
+    def test_dataloader_write_failure_is_a_persistence_error(
+        self, log_dir, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "training.utils.checkpoints.fileio.write_json",
+            MagicMock(side_effect=OSError("disk full")),
+        )
+        ckpt, _, _ = _make(log_dir)
+
+        with pytest.raises(DataloaderStatePersistenceError) as exc_info:
+            ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)
+
+        assert str(exc_info.value.__cause__) == "disk full"
 
     def test_promotable_only_writes_sampler_no_dataloader(self, log_dir):
         ckpt, client, fw = _make(log_dir)
