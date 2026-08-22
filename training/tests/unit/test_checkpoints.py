@@ -9,6 +9,7 @@ import pytest
 
 from training.utils.checkpoints import (
     DATALOADER_BASE_NAME,
+    DataloaderStatePersistenceError,
     ResumeInfo,
     TrainingCheckpoints,
     _logical_name,
@@ -95,6 +96,7 @@ def _make(
     save_state_renames_to: str | None = None,
     serverless=False,
     current_run_id: str | None = None,
+    on_dataloader_saved=None,
 ):
     fw = _mock_fw_client(rows=fw_rows)
     client = _mock_client(fw=fw, save_state_renames_to=save_state_renames_to)
@@ -110,6 +112,7 @@ def _make(
         save_stabilize_s=0.0,
         save_poll_s=0.01,
         current_run_id=current_run_id,
+        on_dataloader_saved=on_dataloader_saved,
     )
     return ckpt, client, fw
 
@@ -324,6 +327,18 @@ class TestResume:
         client.resolve_checkpoint_path.assert_called_once_with("step-3")
         client.load_state_with_optimizer.assert_called_once_with("path://self/step-3")
 
+    def test_same_trainer_required_cursor_fails_before_state_load(self, log_dir):
+        ckpt, client, _ = _make(log_dir, fw_rows=[])
+
+        with pytest.raises(RuntimeError, match="no matching dataloader state"):
+            ckpt.resume(
+                init_from_checkpoint="job-1:step-3",
+                require_dataloader_state=True,
+            )
+
+        client.resolve_checkpoint_path.assert_not_called()
+        client.load_state_with_optimizer.assert_not_called()
+
     def test_dedicated_bare_checkpoint_preserves_initialization_semantics(
         self, log_dir
     ):
@@ -451,12 +466,133 @@ class TestResume:
         assert info == ResumeInfo(step=0, data_consumed=0, source_job_id=None)
         client.load_adapter.assert_called_once_with("hf/adapter")
 
-    def test_list_failure_treated_as_fresh_start(self, log_dir):
+    def test_nonrequired_list_failure_preserves_fresh_start_fallback(self, log_dir):
         ckpt, client, fw = _make(log_dir)
         fw.list_checkpoints.side_effect = RuntimeError("503 Service Unavailable")
-        info = ckpt.resume()
-        assert info is None
+
+        assert ckpt.resume() is None
         client.load_state_with_optimizer.assert_not_called()
+
+    def test_required_list_failure_propagates(self, log_dir):
+        ckpt, client, fw = _make(log_dir)
+        fw.list_checkpoints.side_effect = RuntimeError("503 Service Unavailable")
+        with pytest.raises(RuntimeError, match="503 Service Unavailable"):
+            ckpt.resume(require_dataloader_state=True)
+        client.load_state_with_optimizer.assert_not_called()
+
+    def test_required_cursor_uses_one_snapshot_for_selection_and_load(
+        self, log_dir, monkeypatch
+    ):
+        rows = [
+            _row(
+                "step-10",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-01T00:00:00Z",
+            ),
+            _row(
+                "step-20",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-02T00:00:00Z",
+            ),
+        ]
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            json.dump({"step-10": 80}, f)
+
+        ckpt, client, _ = _make(log_dir, fw_rows=rows)
+        read_dataloader = MagicMock(return_value={"step-10": 80})
+        monkeypatch.setattr(ckpt, "_read_all_dataloader", read_dataloader)
+        info = ckpt.resume(require_dataloader_state=True)
+
+        assert info == ResumeInfo(step=10, data_consumed=80, source_job_id="job-1")
+        client.load_state_with_optimizer.assert_called_once_with("path://self/step-10")
+        read_dataloader.assert_called_once_with(required=True)
+
+    def test_required_cursor_rejects_unpaired_checkpoints(self, log_dir):
+        rows = [
+            _row(
+                "step-20",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-02T00:00:00Z",
+            ),
+        ]
+        ckpt, client, _ = _make(log_dir, fw_rows=rows)
+
+        with pytest.raises(RuntimeError, match="none has matching dataloader state"):
+            ckpt.resume(require_dataloader_state=True)
+
+        client.load_state_with_optimizer.assert_not_called()
+
+    def test_required_cursor_rejects_orphaned_dataloader_state(self, log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            json.dump({"step-10": 80}, f)
+        ckpt, client, _ = _make(log_dir, fw_rows=[])
+
+        with pytest.raises(RuntimeError, match="trainer has no resumable checkpoints"):
+            ckpt.resume(require_dataloader_state=True)
+
+        client.load_state_with_optimizer.assert_not_called()
+
+    def test_required_cursor_rejects_corrupt_dataloader_state(self, log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            f.write("not-json")
+        ckpt, client, _ = _make(log_dir, fw_rows=[])
+
+        with pytest.raises(RuntimeError, match="Corrupt dataloader state"):
+            ckpt.resume(require_dataloader_state=True)
+
+        client.load_state_with_optimizer.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            {"step-10": 3.9},
+            {"step-10": True},
+            {"step-10": -1},
+            [],
+        ],
+    )
+    def test_required_cursor_rejects_invalid_schema(self, log_dir, state):
+        rows = [
+            _row(
+                "step-10",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-01T00:00:00Z",
+            )
+        ]
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            json.dump(state, f)
+        ckpt, client, _ = _make(log_dir, fw_rows=rows)
+
+        with pytest.raises(RuntimeError, match="Corrupt dataloader state"):
+            ckpt.resume(require_dataloader_state=True)
+
+        client.load_state_with_optimizer.assert_not_called()
+
+    def test_optional_cursor_treats_invalid_schema_as_empty(self, log_dir):
+        rows = [
+            _row(
+                "step-10",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2026-04-01T00:00:00Z",
+            )
+        ]
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            json.dump({"step-10": "invalid"}, f)
+        ckpt, client, _ = _make(log_dir, fw_rows=rows)
+
+        info = ckpt.resume()
+
+        assert info == ResumeInfo(step=10, data_consumed=0, source_job_id="job-1")
+        client.load_state_with_optimizer.assert_called_once_with("path://self/step-10")
 
 
 # -- save ----------------------------------------------------------------------
@@ -472,6 +608,141 @@ class TestSave:
 
         with open(os.path.join(log_dir, DATALOADER_BASE_NAME)) as f:
             assert json.load(f) == {"step-1": 100}
+
+    def test_dataloader_callback_observes_write_and_propagates_failure(self, log_dir):
+        def after_write():
+            with open(os.path.join(log_dir, DATALOADER_BASE_NAME)) as f:
+                assert json.load(f) == {"step-1": 100}
+            raise RuntimeError("commit failed")
+
+        ckpt, _, _ = _make(log_dir, on_dataloader_saved=after_write)
+
+        with pytest.raises(DataloaderStatePersistenceError) as exc_info:
+            ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)
+
+        assert str(exc_info.value.__cause__) == "commit failed"
+
+    def test_dataloader_write_failure_is_a_persistence_error(
+        self, log_dir, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "training.utils.checkpoints.fileio.write_json",
+            MagicMock(side_effect=OSError("disk full")),
+        )
+        ckpt, _, _ = _make(log_dir)
+
+        with pytest.raises(DataloaderStatePersistenceError) as exc_info:
+            ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)
+
+        assert str(exc_info.value.__cause__) == "disk full"
+
+    @pytest.mark.parametrize("surface_then_disappear", [False, True])
+    def test_unverified_save_does_not_pair_cursor_with_older_checkpoint(
+        self, log_dir, surface_then_disappear
+    ):
+        older = _row(
+            "step-1",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2025-01-01T00:00:00Z",
+        )
+        ckpt, client, fw = _make(log_dir, fw_rows=[older])
+        client.save_state = MagicMock(return_value=MagicMock())
+        if surface_then_disappear:
+            fresh = _row(
+                "step-1",
+                ctype="CHECKPOINT_TYPE_TRAINING",
+                promotable=False,
+                create_time="2099-01-01T00:00:00Z",
+            )
+            fw.list_checkpoints.side_effect = [[older], [older, fresh], [older]]
+        else:
+            ckpt._save_appear_timeout_s = 0
+        on_saved = MagicMock()
+        ckpt._on_dataloader_saved = on_saved
+
+        with pytest.raises(
+            DataloaderStatePersistenceError, match="pair saved checkpoint"
+        ):
+            ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)
+
+        assert not os.path.exists(os.path.join(log_dir, DATALOADER_BASE_NAME))
+        on_saved.assert_not_called()
+
+    def test_save_resolution_accepts_new_second_precision_row_in_same_second(
+        self, log_dir
+    ):
+        older_same_second = _row(
+            "step-old",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:13Z",
+        )
+        fresh_same_second = _row(
+            "step-new",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:13Z",
+        )
+        ckpt, _, fw = _make(log_dir, fw_rows=[older_same_second])
+        fw._rows.append(fresh_same_second)
+
+        actual = ckpt._resolve_cp_name_after_save(
+            previous_rows=[older_same_second],
+            appear_timeout_s=0.01,
+            stabilize_s=0,
+            poll_s=0.001,
+        )
+
+        assert actual == "step-new"
+
+    def test_save_resolution_does_not_reuse_preexisting_same_second_row(self, log_dir):
+        existing = _row(
+            "step-old",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:13Z",
+        )
+        ckpt, _, _ = _make(log_dir, fw_rows=[existing])
+
+        with pytest.raises(RuntimeError, match="waiting for the saved checkpoint"):
+            ckpt._resolve_cp_name_after_save(
+                previous_rows=[existing],
+                appear_timeout_s=0.01,
+                stabilize_s=0,
+                poll_s=0.001,
+            )
+
+    def test_save_resolution_ignores_updates_to_preexisting_row(self, log_dir):
+        existing = _row(
+            "step-old",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:12Z",
+        )
+        updated = {
+            **existing,
+            "updateTime": "2026-04-29T10:00:14Z",
+            "checkpointType": "CHECKPOINT_TYPE_TRAINING_LORA",
+            "promotable": True,
+        }
+        fresh = _row(
+            "step-new",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:13Z",
+        )
+        ckpt, _, _ = _make(log_dir, fw_rows=[existing])
+        ckpt._list_checkpoints = MagicMock(return_value=[updated, fresh])
+
+        actual = ckpt._resolve_cp_name_after_save(
+            previous_rows=[existing],
+            appear_timeout_s=0.01,
+            stabilize_s=0,
+            poll_s=0.001,
+        )
+
+        assert actual == "step-new"
 
     def test_promotable_only_writes_sampler_no_dataloader(self, log_dir):
         ckpt, client, fw = _make(log_dir)

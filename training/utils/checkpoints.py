@@ -38,9 +38,10 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import training.utils.fileio as fileio
 
@@ -68,6 +69,16 @@ class ResumeInfo:
     #: Cumulative raw rows from the source dataset (incl. drops / sample failures), across all runs.
     data_consumed: int = 0
     source_job_id: str | None = None
+
+
+class DataloaderStatePersistenceError(RuntimeError):
+    """Raised when checkpoint cursor state cannot be made durable."""
+
+
+@dataclass(frozen=True)
+class _ResumeCandidate:
+    row: dict
+    data_consumed: int | None
 
 
 class _CheckpointLister(Protocol):
@@ -175,6 +186,13 @@ def _belongs_to_run(short: str, current_run_id: str | None = None) -> bool:
 def _is_resumable_row(row: dict) -> bool:
     ctype = row.get("checkpointType", "") or ""
     return any(ctype.endswith(suffix) for suffix in _RESUMABLE_TYPE_SUFFIXES)
+
+
+def _checkpoint_row_identity(row: dict) -> tuple[str, str]:
+    return (
+        str(row.get("name") or ""),
+        str(row.get("createTime") or ""),
+    )
 
 
 def _parse_iso_time(value: str | None) -> datetime | None:
@@ -333,6 +351,7 @@ class TrainingCheckpoints:
         save_stabilize_s: float = 15.0,
         save_poll_s: float = 3.0,
         current_run_id: str | None = None,
+        on_dataloader_saved: Callable[[], None] | None = None,
     ) -> None:
         self._client = client
         self._fw_client = fw_client
@@ -346,6 +365,7 @@ class TrainingCheckpoints:
         self._save_appear_timeout_s = save_appear_timeout_s
         self._save_stabilize_s = save_stabilize_s
         self._save_poll_s = save_poll_s
+        self._on_dataloader_saved = on_dataloader_saved
 
     # -- Save --------------------------------------------------------------
 
@@ -374,24 +394,29 @@ class TrainingCheckpoints:
 
         t0 = time.time()
         if resumable:
-            # Record save start time so we can wait for the control plane to
-            # reflect a row newer than this save. The trainer may rename to its
-            # internal step counter (caller passes "step-42", service stores
-            # as "step-0") — and resume reads names from the control plane —
-            # so ``dataloader.json`` must be keyed on whatever name ends up as
-            # the newest resumable row (which is exactly what resume will pick).
-            t_save_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            previous_rows: list[dict] = []
+            if data_consumed is not None:
+                try:
+                    previous_rows = self._current_resumable_rows()
+                except Exception as error:
+                    raise DataloaderStatePersistenceError(
+                        "Failed to snapshot checkpoints before saving dataloader state"
+                    ) from error
             logger.info("Saving DCP checkpoint '%s'...", name)
             self._client.save_state(name)
             logger.info("DCP checkpoint '%s' saved (%.1fs)", name, time.time() - t0)
             if data_consumed is not None:
-                actual_name = self._resolve_cp_name_after_save(
-                    fallback=name,
-                    save_started_iso=t_save_iso,
-                    appear_timeout_s=self._save_appear_timeout_s,
-                    stabilize_s=self._save_stabilize_s,
-                    poll_s=self._save_poll_s,
-                )
+                try:
+                    actual_name = self._resolve_cp_name_after_save(
+                        previous_rows=previous_rows,
+                        appear_timeout_s=self._save_appear_timeout_s,
+                        stabilize_s=self._save_stabilize_s,
+                        poll_s=self._save_poll_s,
+                    )
+                except Exception as error:
+                    raise DataloaderStatePersistenceError(
+                        "Failed to pair saved checkpoint with dataloader state"
+                    ) from error
                 self._write_dataloader(actual_name, data_consumed)
                 if actual_name != name:
                     logger.info(
@@ -437,6 +462,7 @@ class TrainingCheckpoints:
         *,
         init_from_checkpoint: str | None = None,
         warm_start_from_adapter: str | None = None,
+        require_dataloader_state: bool = False,
     ) -> ResumeInfo | None:
         """Determine resume state and load weights into the live client.
 
@@ -463,6 +489,10 @@ class TrainingCheckpoints:
                 trainer_id=self._trainer_id,
             )
             if ref.restore_recipe_state:
+                data_consumed = self._read_dataloader(
+                    ref.checkpoint_name,
+                    required=require_dataloader_state,
+                )
                 path = self._client.resolve_checkpoint_path(ref.checkpoint_name)
                 logger.info(
                     "Resuming from explicit same-trainer checkpoint: %s",
@@ -473,7 +503,7 @@ class TrainingCheckpoints:
                 logger.info("Checkpoint loaded: %s (%.1fs)", path, time.time() - t0)
                 return ResumeInfo(
                     step=_step_from_name(ref.checkpoint_name),
-                    data_consumed=self._read_dataloader(ref.checkpoint_name),
+                    data_consumed=data_consumed,
                     source_job_id=None if self._serverless else self._trainer_id,
                 )
             path = self._client.resolve_checkpoint_path(
@@ -494,10 +524,16 @@ class TrainingCheckpoints:
                 source_job_id=ref.source_job_id,
             )
 
-        latest = self._latest_resumable()
-        if latest:
+        candidate = self._latest_resumable(
+            require_dataloader_state=require_dataloader_state
+        )
+        if candidate:
+            latest = candidate.row
             short = _short_name(latest["name"])
             logical = self._trainer_logical_name(short)
+            data_consumed = candidate.data_consumed
+            if data_consumed is None:
+                data_consumed = self._read_dataloader(logical)
             # In serverless mode the pooled multi-session trainer namespaces
             # checkpoints under the current run/session itself and rejects a
             # cross_job://<session_id>/<name> ref (session_id is not a source
@@ -513,7 +549,7 @@ class TrainingCheckpoints:
             logger.info("Checkpoint loaded: %s (%.1fs)", path, time.time() - t0)
             return ResumeInfo(
                 step=_step_from_name(logical),
-                data_consumed=self._read_dataloader(logical),
+                data_consumed=data_consumed,
                 source_job_id=None if self._serverless else self._trainer_id,
             )
 
@@ -578,41 +614,55 @@ class TrainingCheckpoints:
     def _list_checkpoints(self) -> list[dict]:
         return self._fw_client.list_checkpoints(self._trainer_id)
 
+    def _current_resumable_rows(self) -> list[dict]:
+        return [
+            row
+            for row in self._list_checkpoints()
+            if _is_resumable_row(row) and self._row_matches_current_run(row)
+        ]
+
     def _resolve_cp_name_after_save(
         self,
         *,
-        fallback: str,
-        save_started_iso: str,
+        previous_rows: list[dict],
         appear_timeout_s: float,
         stabilize_s: float,
         poll_s: float,
     ) -> str:
         """Wait for the save to surface, let the CP state stabilize, then
-        return the short name of the row resume would pick (newest resumable).
+        return the short name of the row created by this save.
 
         The control plane can show a transient row name mid-save before the
         trainer's internal bookkeeping consolidates (e.g. caller writes
         ``step-2`` but the service later collapses it into ``step-0``). Picking
-        the "first new name" would race with that consolidation and store a
-        dataloader key that resume never sees. Instead we mirror
-        :meth:`_latest_resumable` exactly: after a brief stabilization window,
-        pick the newest resumable row.
+        the first changed row would race with that consolidation and store a
+        dataloader key that resume never sees. After a brief stabilization
+        window, require exactly one row identity absent from the pre-save
+        snapshot.
         """
+        previous = Counter(_checkpoint_row_identity(row) for row in previous_rows)
+
+        def new_rows(rows: list[dict]) -> list[dict]:
+            remaining = previous.copy()
+            added = []
+            for row in rows:
+                if not _is_resumable_row(row) or not self._row_matches_current_run(row):
+                    continue
+                identity = _checkpoint_row_identity(row)
+                if remaining[identity]:
+                    remaining[identity] -= 1
+                else:
+                    added.append(row)
+            return added
+
         deadline = time.time() + appear_timeout_s
         while time.time() < deadline:
             try:
                 rows = self._list_checkpoints()
             except AttributeError as e:
-                # Permanent: the control-plane client doesn't implement
-                # ``list_checkpoints`` (e.g. a unit-test fake). Don't burn
-                # the appear_timeout — fall back to the caller name now.
-                logger.warning(
-                    "list_checkpoints not implemented on control-plane client (%s); "
-                    "falling back to caller name %r for dataloader.json.",
-                    e,
-                    fallback,
-                )
-                return fallback
+                raise RuntimeError(
+                    "Control-plane client cannot verify the saved checkpoint"
+                ) from e
             except Exception as e:
                 logger.debug(
                     "list_checkpoints during save-resolution failed: %s; retrying.",
@@ -620,43 +670,33 @@ class TrainingCheckpoints:
                 )
                 time.sleep(poll_s)
                 continue
-            surfaced = any(
-                _is_resumable_row(r)
-                and self._row_matches_current_run(r)
-                and r.get("createTime", "") >= save_started_iso
-                for r in rows
-            )
-            if surfaced:
+            if new_rows(rows):
                 break
             time.sleep(poll_s)
         else:
-            logger.warning(
-                "Timed out after %.0fs waiting for CP to surface save (>= %s); "
-                "falling back to caller name %r for dataloader.json.",
-                appear_timeout_s,
-                save_started_iso,
-                fallback,
+            raise RuntimeError(
+                "Timed out after "
+                f"{appear_timeout_s:.0f}s waiting for the saved checkpoint to surface"
             )
-            return fallback
 
         time.sleep(stabilize_s)
 
         try:
             rows = self._list_checkpoints()
         except Exception as e:
-            logger.warning(
-                "list_checkpoints after stabilize failed (%s); falling back to %r.",
-                e,
-                fallback,
+            raise RuntimeError(
+                "Could not verify the saved checkpoint after stabilization"
+            ) from e
+        candidates = new_rows(rows)
+        if not candidates:
+            raise RuntimeError("The saved checkpoint disappeared after stabilization")
+        if len(candidates) != 1:
+            names = sorted(str(row.get("name") or "") for row in candidates)
+            raise RuntimeError(
+                "Could not uniquely identify the saved checkpoint after stabilization: "
+                f"{names}"
             )
-            return fallback
-        resumable = [
-            r for r in rows if _is_resumable_row(r) and self._row_matches_current_run(r)
-        ]
-        if not resumable:
-            return fallback
-        newest = _newest_first(resumable)[0]
-        return self._trainer_logical_name(_short_name(newest["name"]))
+        return self._trainer_logical_name(_short_name(candidates[0]["name"]))
 
     def _wait_for_promotable_after_save(
         self,
@@ -705,22 +745,44 @@ class TrainingCheckpoints:
         )
         return None
 
-    def _latest_resumable(self) -> dict | None:
+    def _latest_resumable(
+        self, *, require_dataloader_state: bool = False
+    ) -> _ResumeCandidate | None:
         try:
             rows = [
                 r
                 for r in self._list_checkpoints()
                 if _is_resumable_row(r) and self._row_matches_current_run(r)
             ]
-        except Exception as e:
+        except Exception as error:
+            if require_dataloader_state:
+                raise
             logger.warning(
                 "Control-plane list_checkpoints failed (%s); treating as fresh start. "
                 "Override with init_from_checkpoint if this is wrong.",
-                e,
+                error,
             )
             return None
         rows = _newest_first(rows)
-        return rows[0] if rows else None
+        if not require_dataloader_state:
+            return _ResumeCandidate(rows[0], None) if rows else None
+
+        dataloader = self._read_all_dataloader(required=True)
+        if not rows:
+            if dataloader:
+                raise RuntimeError(
+                    "Dataloader state exists, but the trainer has no resumable "
+                    "checkpoints"
+                )
+            return None
+        for row in rows:
+            logical = self._trainer_logical_name(_short_name(row["name"]))
+            if logical in dataloader:
+                return _ResumeCandidate(row, dataloader[logical])
+        raise RuntimeError(
+            "Resumable checkpoints exist, but none has matching dataloader state "
+            f"in {self._dataloader_path()}"
+        )
 
     def _row_matches_current_run(self, row: dict) -> bool:
         if not self._serverless:
@@ -778,7 +840,7 @@ class TrainingCheckpoints:
     def _dataloader_path(self) -> str:
         return fileio.join(self._log_path, DATALOADER_BASE_NAME)
 
-    def _read_all_dataloader(self) -> dict[str, int]:
+    def _read_all_dataloader(self, *, required: bool = False) -> dict[str, int]:
         path = self._dataloader_path()
         raw = fileio.read_text(path)
         if not raw:
@@ -786,21 +848,48 @@ class TrainingCheckpoints:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
+            if required:
+                raise RuntimeError(f"Corrupt dataloader state in {path}: {e}") from e
             logger.warning("Corrupt %s (%s); treating as empty.", path, e)
             return {}
-        return {k: int(v) for k, v in data.items()}
+        invalid = (
+            not isinstance(data, dict)
+            or any(type(value) is not int or value < 0 for value in data.values())
+        )
+        if invalid:
+            error = "expected an object of non-negative integers"
+            if required:
+                raise RuntimeError(f"Corrupt dataloader state in {path}: {error}")
+            logger.warning("Corrupt %s (%s); treating as empty.", path, error)
+            return {}
+        return data
 
     def _write_dataloader(self, name: str, data_consumed: int) -> None:
-        data = self._read_all_dataloader()
-        data[name] = data_consumed
-        if len(data) > DATALOADER_HISTORY_KEEP:
-            ordered = sorted(data.items(), key=lambda kv: _step_from_name(kv[0]))
-            data = dict(ordered[-DATALOADER_HISTORY_KEEP:])
-        fileio.makedirs(self._log_path)
-        fileio.write_json(self._dataloader_path(), data)
+        try:
+            data = self._read_all_dataloader(required=True)
+            data[name] = data_consumed
+            if len(data) > DATALOADER_HISTORY_KEEP:
+                ordered = sorted(data.items(), key=lambda kv: _step_from_name(kv[0]))
+                data = dict(ordered[-DATALOADER_HISTORY_KEEP:])
+            fileio.makedirs(self._log_path)
+            fileio.write_json(self._dataloader_path(), data)
+            if self._on_dataloader_saved is not None:
+                self._on_dataloader_saved()
+        except DataloaderStatePersistenceError:
+            raise
+        except Exception as error:
+            raise DataloaderStatePersistenceError(
+                f"Failed to persist dataloader state in {self._dataloader_path()}"
+            ) from error
 
-    def _read_dataloader(self, name: str) -> int:
-        return self._read_all_dataloader().get(name, 0)
+    def _read_dataloader(self, name: str, *, required: bool = False) -> int:
+        data = self._read_all_dataloader(required=required)
+        if required and name not in data:
+            raise RuntimeError(
+                f"Checkpoint {name!r} has no matching dataloader state in "
+                f"{self._dataloader_path()}"
+            )
+        return data.get(name, 0)
 
 
 def _step_from_name(name: str) -> int:

@@ -40,7 +40,9 @@ Written to `{log_path}/dataloader.json`. Single int per checkpoint name:
 {"step-10": 40, "step-50": 200}
 ```
 
-Bounded to the newest 20 entries. There is no `checkpoints.jsonl` — never has been, in the new model. The control plane (`FireworksClient.list_checkpoints(job_id)`) is queried at resume / promote time for everything else.
+Bounded to the newest 20 entries. There is no `checkpoints.jsonl` — never has been, in the new model. The control plane (`FireworksClient.list_checkpoints(job_id)`) is queried at resume / promote time for everything else. The async RL recipe resumes from the newest remote DCP row whose logical name is present in this file. A newer unpaired row is skipped, and resume fails closed if remote resumable rows exist but none has cursor metadata.
+
+`async_rl_loop.main(..., on_dataloader_saved=callback)` invokes the optional callback after the atomic `dataloader.json` write. Use it when the local cursor lives on storage that requires an explicit durability barrier. Exceptions propagate to the recipe; the Cookbook does not import or manage the storage provider.
 
 ## When each axis is used
 
@@ -85,7 +87,7 @@ Priority inside `TrainingCheckpoints.resume` (highest first):
    restores weights, optimizer, recipe step, and the local dataset cursor.
    Dedicated bare/path/cross-job and serverless cross-run references restore
    weights and optimizer but start a new recipe position at step/cursor 0.
-2. Newest resumable row on the control plane for the current trainer — auto-resume.
+2. Newest resumable row on the control plane for the current trainer whose logical name has a matching `dataloader.json` entry — auto-resume. Checkpoint discovery and missing cursor state fail closed in async RL.
 3. `warm_start_from_adapter` — fresh start with adapter weights.
 4. None — fresh start from `base_model`.
 
