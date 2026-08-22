@@ -188,13 +188,10 @@ def _is_resumable_row(row: dict) -> bool:
     return any(ctype.endswith(suffix) for suffix in _RESUMABLE_TYPE_SUFFIXES)
 
 
-def _checkpoint_row_identity(row: dict) -> tuple[str, str, str, str, bool]:
+def _checkpoint_row_identity(row: dict) -> tuple[str, str]:
     return (
         str(row.get("name") or ""),
         str(row.get("createTime") or ""),
-        str(row.get("updateTime") or ""),
-        str(row.get("checkpointType") or ""),
-        bool(row.get("promotable")),
     )
 
 

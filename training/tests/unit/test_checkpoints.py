@@ -713,6 +713,37 @@ class TestSave:
                 poll_s=0.001,
             )
 
+    def test_save_resolution_ignores_updates_to_preexisting_row(self, log_dir):
+        existing = _row(
+            "step-old",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:12Z",
+        )
+        updated = {
+            **existing,
+            "updateTime": "2026-04-29T10:00:14Z",
+            "checkpointType": "CHECKPOINT_TYPE_TRAINING_LORA",
+            "promotable": True,
+        }
+        fresh = _row(
+            "step-new",
+            ctype="CHECKPOINT_TYPE_TRAINING",
+            promotable=False,
+            create_time="2026-04-29T10:00:13Z",
+        )
+        ckpt, _, _ = _make(log_dir, fw_rows=[existing])
+        ckpt._list_checkpoints = MagicMock(return_value=[updated, fresh])
+
+        actual = ckpt._resolve_cp_name_after_save(
+            previous_rows=[existing],
+            appear_timeout_s=0.01,
+            stabilize_s=0,
+            poll_s=0.001,
+        )
+
+        assert actual == "step-new"
+
     def test_promotable_only_writes_sampler_no_dataloader(self, log_dir):
         ckpt, client, fw = _make(log_dir)
         ckpt.save("step-1", resumable=False, promotable=True)
