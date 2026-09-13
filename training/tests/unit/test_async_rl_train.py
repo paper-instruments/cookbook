@@ -648,6 +648,40 @@ def test_raw_rewards_include_filtered_groups_but_not_failed_rollouts() -> None:
     _run(scenario())
 
 
+def test_producer_filter_observes_transformed_rewards_and_matching_advantages() -> None:
+    async def scenario() -> None:
+        seen = []
+
+        async def rollout(index):
+            return _rollout_run([0.8, 1.0][index])
+
+        def accept(group):
+            seen.append(group)
+            return group.rewards == [0.8, 0.5]
+
+        coordinator = _coordinator(
+            [_row(0, run_factory=rollout)],
+            completions_per_prompt=2,
+            prompt_groups_per_step=1,
+            training_chunks_per_step=1,
+            reward_transform=lambda _runs, rewards: [r if r < 1 else r - 0.5 for r in rewards],
+            advantage_fn=lambda rewards: [r - sum(rewards) / len(rewards) for r in rewards],
+            dynamic_filter_fn=accept,
+        )
+        async with coordinator:
+            batch = await asyncio.wait_for(coordinator.next_batch(), timeout=1.0)
+            assert batch is not None
+            assert await _consume(batch) == [1]
+            assert len(seen) == 1
+            assert seen[0].rewards == [0.8, 0.5]
+            assert seen[0].advantages == pytest.approx([0.15, -0.15])
+            assert list(batch.prompt_groups) == seen
+            coordinator.publish(batch)
+            assert await coordinator.next_batch() is None
+
+    _run(scenario())
+
+
 def test_recoverable_rollout_error_drops_and_continues() -> None:
     async def scenario() -> None:
         async def timeout(_sub_index: int) -> RolloutRun:

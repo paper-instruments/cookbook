@@ -20,6 +20,7 @@ from typing import Callable, Dict, Hashable, List, Optional
 from training.utils.data import compute_advantages
 from training.utils.rl.losses import PromptGroup
 from training.utils.rl.rollout.types import (
+    RewardTransform,
     Rollout,
     RolloutRun,
     rollout_to_prompt_group,
@@ -98,6 +99,7 @@ class GroupAssembler:
         *,
         completions_per_prompt: int,
         advantage_fn: AdvantageFn = compute_advantages,
+        reward_transform: RewardTransform | None = None,
         with_reference: bool = False,
         router_replay_completion_only: bool = False,
         min_group_size: int = 1,
@@ -108,6 +110,7 @@ class GroupAssembler:
             raise ValueError("min_group_size must be >= 1")
         self._n = completions_per_prompt
         self._advantage_fn = advantage_fn
+        self._reward_transform = reward_transform
         self._with_reference = with_reference
         self._r3_completion_only = router_replay_completion_only
         self._min_group_size = min_group_size
@@ -195,6 +198,7 @@ class GroupAssembler:
         pg = rollout_to_prompt_group(
             rollout,
             advantage_fn=self._advantage_fn,
+            reward_transform=self._reward_transform,
             with_reference=self._with_reference,
             router_replay_completion_only=self._r3_completion_only,
         )
@@ -223,6 +227,7 @@ class GroupAssembler:
             pg = rollout_to_prompt_group(
                 rollout,
                 advantage_fn=self._advantage_fn,
+                reward_transform=self._reward_transform,
                 with_reference=self._with_reference,
                 router_replay_completion_only=self._r3_completion_only,
             )

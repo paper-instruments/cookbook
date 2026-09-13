@@ -87,6 +87,17 @@ run. Each trajectory is then packed as a separate trainer datum. Thus a group
 with `R` surviving runs has `R` rewards and advantages, while its trainer datum
 count is `sum(len(run.segments) for run in runs)` and may exceed `R`.
 
+For group-dependent reward shaping, pass
+`reward_transform(runs, rewards) -> list[float]` to `async_rl_loop.main`.
+It receives validated surviving runs and their original scalar rewards, before
+advantage computation and dynamic filtering, including partial groups. Return
+one finite shaped reward per run, in the same order. Preserve segment rewards,
+tokens, masks, logprobs, and routing; accounting may be added to `run.metadata`.
+`PromptGroup.rewards` and advantages use the shaped rewards, while
+segment rewards remain unchanged. Evaluation bypasses this training hook.
+The existing `rollout/raw_reward` metric means pre-filter reward; with this
+hook it reports shaped rewards, not the original environment scores.
+
 `RolloutSetup` contains the tokenizer, tokenizer ID, sampling kwargs, inference
 base URL, API key, deployment model, group size, caller-provided `extras`, and
 the recipe-owned sampling client. The dedicated recipe supplies its managed

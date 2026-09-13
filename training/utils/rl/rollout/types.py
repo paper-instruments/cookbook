@@ -42,6 +42,7 @@ from training.utils.supervised import build_multimodal_policy_datum
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "RewardTransform",
     "RolloutSample",
     "RolloutRun",
     "Rollout",
@@ -108,6 +109,9 @@ class RolloutRun:
     segments: List[RolloutSample]
     run_id: str | None = None
     metadata: dict | None = None
+
+
+RewardTransform = Callable[[List[RolloutRun], List[float]], List[float]]
 
 
 @dataclass
@@ -303,6 +307,7 @@ def rollout_to_prompt_group(
     rollout: Rollout,
     *,
     advantage_fn: Callable[[List[float]], List[float]] = compute_advantages,
+    reward_transform: RewardTransform | None = None,
     with_reference: bool = False,
     router_replay_completion_only: bool = False,
 ) -> PromptGroup | None:
@@ -330,6 +335,15 @@ def rollout_to_prompt_group(
     rewards = [
         _run_reward(run, run_index) for run_index, run in enumerate(rollout.runs)
     ]
+    if reward_transform is not None:
+        if any(not math.isfinite(reward) for reward in rewards):
+            raise ValueError("reward_transform requires finite original run rewards")
+        transformed = list(reward_transform(list(rollout.runs), list(rewards)))
+        if len(transformed) != len(rewards):
+            raise ValueError("reward_transform must return one reward per rollout run")
+        rewards = [float(reward) for reward in transformed]
+        if any(not math.isfinite(reward) for reward in rewards):
+            raise ValueError("reward_transform must return finite rewards")
     advantages = list(advantage_fn(list(rewards)))
     if len(advantages) != len(rewards):
         raise ValueError(

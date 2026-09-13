@@ -83,7 +83,7 @@ from training.utils.rl.losses import combine_prompt_groups
 from training.utils.rl.router_replay import warn_if_full_sequence_router_replay
 from training.utils.rl.tis import TISConfig
 from training.train_loop import DynamicFilterFn
-from training.utils.rl.rollout import RolloutRun
+from training.utils.rl.rollout import RewardTransform, RolloutRun
 from training.utils.timer import elapsed_timer, flush_timing, wall_timer
 
 logger = logging.getLogger(__name__)
@@ -294,6 +294,7 @@ def main(
     *,
     rollout_fn_factory: RolloutFnFactory,
     dynamic_filter_fn: DynamicFilterFn | None = None,
+    reward_transform: RewardTransform | None = None,
     evaluation_fn: RolloutEvaluationFn | None = None,
     evaluation_interval: int = 1,
     rows: list[dict] | None = None,
@@ -750,6 +751,7 @@ def main(
                 min_group_size=cfg.min_group_size,
                 max_incomplete_group_retries=cfg.max_incomplete_group_retries,
                 dynamic_filter_fn=dynamic_filter_fn,
+                reward_transform=reward_transform,
                 global_step=step_offset,
                 resolved_rows_offset=prior_rows_consumed,
                 resolved_rows_fn=lambda: row_loader.data_consumed,

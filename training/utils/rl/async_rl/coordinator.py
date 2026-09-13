@@ -26,6 +26,7 @@ from training.utils.rl.async_rl.producer import (
     _PRODUCER_FINISHED,
 )
 from training.utils.rl.rollout.group_assembler import AdvantageFn
+from training.utils.rl.rollout.types import RewardTransform
 
 T = TypeVar("T")
 
@@ -52,6 +53,7 @@ class AsyncRLCoordinator:
         max_head_off_policy_versions: int,
         max_concurrent_rollouts: int | None = None,
         advantage_fn: AdvantageFn = compute_advantages,
+        reward_transform: RewardTransform | None = None,
         with_reference: bool = False,
         router_replay_completion_only: bool = False,
         min_group_size: int = 1,
@@ -81,6 +83,7 @@ class AsyncRLCoordinator:
             max_head_off_policy_versions=max_head_off_policy_versions,
             max_concurrent_rollouts=max_concurrent_rollouts,
             advantage_fn=advantage_fn,
+            reward_transform=reward_transform,
             with_reference=with_reference,
             router_replay_completion_only=router_replay_completion_only,
             min_group_size=min_group_size,
