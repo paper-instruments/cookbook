@@ -72,6 +72,29 @@ def test_router_replay_skips_model_lookup_when_not_requested(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("requested", [False, True])
+def test_router_replay_overrides_glm_5p3_flash_metadata(
+    monkeypatch, caplog, requested
+):
+    monkeypatch.setattr(
+        service,
+        "FireworksClient",
+        lambda **_kwargs: pytest.fail("known GLM model should not require lookup"),
+    )
+
+    assert (
+        resolve_router_replay_enabled(
+            requested=requested,
+            api_key="k",
+            base_url="https://api",
+            additional_headers=None,
+            base_model="accounts/fireworks/models/glm-5p3-flash",
+        )
+        is requested
+    )
+    assert ("despite catalog MoE metadata" in caplog.text) is requested
+
+
 @pytest.mark.parametrize("is_moe", [False, True])
 def test_router_replay_follows_model_architecture(monkeypatch, is_moe):
     class FakeClient:
