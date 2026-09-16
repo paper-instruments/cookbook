@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fireworks.training.sdk import (
@@ -11,6 +12,10 @@ from fireworks.training.sdk import (
 )
 
 from training.utils.config import DeployConfig, TrainerConfig
+
+logger = logging.getLogger(__name__)
+
+_GLM_5P3_FLASH_MODEL = "accounts/fireworks/models/glm-5p3-flash"
 
 
 def resolve_router_replay_enabled(
@@ -24,6 +29,13 @@ def resolve_router_replay_enabled(
     """Enable Router Replay only when the base model can produce routing data."""
     if not requested:
         return False
+    if base_model == _GLM_5P3_FLASH_MODEL:
+        # Fireworks catalog metadata currently misclassifies this sparse MoE as dense.
+        logger.warning(
+            "Enabling Router Replay for %s despite catalog MoE metadata",
+            base_model,
+        )
+        return True
     with FireworksClient(
         api_key=api_key,
         base_url=base_url,

@@ -85,6 +85,7 @@ from training.utils.rl.rollout.trace import (
     analyze_turns,
 )
 from training.utils.rl.rollout.types import (
+    RewardTransform,
     Rollout,
     RolloutRun,
     RolloutSample,
@@ -110,6 +111,7 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "RewardTransform",
     "InferenceCall",
     "GroupAssembler",
     "MessageTrajectoryAssembler",

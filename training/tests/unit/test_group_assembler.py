@@ -7,10 +7,15 @@ passthrough, row_meta propagation, and drain-at-shutdown.
 
 from __future__ import annotations
 
+import copy
+
+import pytest
+
 from training.utils.rl.rollout import (
     GroupAssembler,
     RolloutRun,
     RolloutSample,
+    count_trainable_tokens,
 )
 
 
@@ -124,6 +129,59 @@ class TestAdvantageFn:
         assert out.pg.rewards == [0.7]
         assert out.pg.advantages == [0.7]
         assert out.min_submit_version == 3
+
+
+@pytest.mark.parametrize("drain", [False, True])
+def test_reward_transform_precedes_run_advantages_without_mutating_segments(drain):
+    runs = [RolloutRun(segments=[_sample(1.0), _sample(1.0)]), _run(0.8)]
+    original = copy.deepcopy(runs)
+    observed = []
+
+    def transform(valid_runs, rewards):
+        observed.append((valid_runs, rewards))
+        return [
+            reward - 0.2 * count_trainable_tokens(run)
+            for run, reward in zip(valid_runs, rewards)
+        ]
+
+    asm = GroupAssembler(
+        completions_per_prompt=3 if drain else 2,
+        min_group_size=2,
+        reward_transform=transform,
+    )
+    for _ in range(3 if drain else 2):
+        asm.note_started("r", submit_version=0)
+    assert asm.add_run("r", runs[0]) is None
+    out = asm.add_run("r", runs[1])
+    if drain:
+        assert out is None
+        [out] = asm.drain()
+
+    assert out is not None and out.pg is not None
+    assert observed == [(runs, [1.0, 0.8])]
+    assert runs == original
+    assert out.pg.rewards == pytest.approx([0.2, 0.4])
+    # Two logical rewards, not three segment rewards, define normalization.
+    assert out.pg.advantages == pytest.approx([-2**-0.5, -2**-0.5, 2**-0.5])
+    assert len(out.pg.data) == 3
+    assert [datum.loss_fn_inputs["target_tokens"].data for datum in out.pg.data] == [[2, 3]] * 3
+
+
+@pytest.mark.parametrize("result", [[0.1], [float("nan"), 0.2], [float("inf"), 0.2]])
+def test_reward_transform_rejects_invalid_output_before_advantages(result):
+    def advantages(_rewards):
+        pytest.fail("invalid transformed rewards reached advantage computation")
+
+    asm = GroupAssembler(
+        completions_per_prompt=2,
+        reward_transform=lambda _runs, _rewards: result,
+        advantage_fn=advantages,
+    )
+    for _ in range(2):
+        asm.note_started("r", submit_version=0)
+    asm.add_run("r", _run(1.0))
+    with pytest.raises(ValueError, match="reward_transform"):
+        asm.add_run("r", _run(0.8))
 
 
 class TestRowMeta:

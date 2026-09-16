@@ -27,6 +27,7 @@ from training.utils.rl.rollout.group_assembler import (
     RowResolution,
 )
 from training.utils.rl.rollout.types import (
+    RewardTransform,
     RolloutRun,
     validate_rollout_run_routing,
 )
@@ -118,6 +119,7 @@ class RolloutProducer:
         max_head_off_policy_versions: int,
         max_concurrent_rollouts: int | None,
         advantage_fn: AdvantageFn,
+        reward_transform: RewardTransform | None = None,
         with_reference: bool,
         router_replay_completion_only: bool,
         min_group_size: int,
@@ -161,6 +163,7 @@ class RolloutProducer:
         self._assembler = GroupAssembler(
             completions_per_prompt=completions_per_prompt,
             advantage_fn=advantage_fn,
+            reward_transform=reward_transform,
             with_reference=with_reference,
             router_replay_completion_only=router_replay_completion_only,
             min_group_size=min_group_size,
