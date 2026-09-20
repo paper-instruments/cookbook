@@ -1,19 +1,18 @@
-"""Pure-logic tests for the async_rl_loop runtime helpers.
-
-Covers the deterministic pieces that don't require tinker, the Fireworks
-SDK, or a deployment.
-"""
+"""CPU tests for async_rl_loop with remote services mocked."""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import tinker
 
 from training.recipes import async_rl_loop
+from training.utils.rl.rollout import RolloutRun, RolloutSample
 
 
 class _StopAfterProvisioning(RuntimeError):
@@ -80,30 +79,23 @@ class TestConfigDefaults:
 
         assert cfg.pipeline_chunks_per_step == 1
 
-    def test_config_exposes_only_grpo_knobs(self) -> None:
+    def test_config_defaults_to_rollout_anchored_cispo(self) -> None:
         cfg = async_rl_loop.Config(log_path="gs://logs")
 
-        assert cfg.kl_beta == 0.001
-        assert cfg.eps_clip == 0.2
-        assert cfg.eps_clip_high is None
-        assert cfg.anchor_logp == "old_policy"
+        assert cfg.kl_beta == 0
+        assert cfg.cispo_clip_low_threshold == 0
+        assert cfg.cispo_clip_high_threshold == 5
+        assert cfg.anchor_logp == "rollout"
         assert cfg.router_replay is True
         assert cfg.router_replay_completion_only is True
         assert not hasattr(cfg, "policy_loss")
         assert not hasattr(cfg, "loss_path")
 
 
-def test_main_has_direct_client_grpo_customization_boundary() -> None:
-    source = inspect.getsource(async_rl_loop.main)
-
-    assert "make_grpo_loss_fn(" in source
-    assert "policy.forward_backward_custom(" in source
-    assert 'cfg.anchor_logp == "old_policy"' in source
-    assert "To switch to built-in PPO or another loss" in source
-    assert "adding dispatch" in source
-    assert "skills/fireworks-training/references/rl-custom-loss.md" in source
-    assert "build_loss_fn" not in source
-    assert "loss_path" not in source
+@pytest.mark.parametrize("field", ["eps_clip", "eps_clip_high", "tis"])
+def test_config_rejects_obsolete_grpo_knobs(field) -> None:
+    with pytest.raises(TypeError, match=field):
+        async_rl_loop.Config(log_path="gs://logs", **{field: 0.2})
 
 
 @pytest.mark.parametrize(
@@ -116,7 +108,7 @@ def test_main_has_direct_client_grpo_customization_boundary() -> None:
 def test_main_rejects_unused_reference_trainer_config(trainer) -> None:
     cfg = async_rl_loop.Config(log_path="gs://logs", kl_beta=0, trainer=trainer)
 
-    with pytest.raises(ValueError, match="require kl_beta > 0"):
+    with pytest.raises(ValueError, match="does not use a reference trainer"):
         async_rl_loop.main(
             cfg,
             rows=[],
@@ -125,29 +117,33 @@ def test_main_rejects_unused_reference_trainer_config(trainer) -> None:
 
 
 @pytest.mark.parametrize(
-    "config_overrides",
-    [{"eps_clip": -0.1}, {"eps_clip_high": -0.1}, {"kl_beta": -0.1}],
+    "config_overrides, error",
+    [
+        ({"kl_beta": 0.001}, "requires kl_beta=0"),
+        ({"kl_beta": float("nan")}, "requires kl_beta=0"),
+        ({"anchor_logp": "old_policy"}, "anchor_logp='rollout'"),
+        ({"anchor_logp": "unknown"}, "anchor_logp='rollout'"),
+        ({"cispo_clip_low_threshold": -0.1}, "0 <= low < high"),
+        ({"cispo_clip_low_threshold": 6}, "0 <= low < high"),
+        ({"cispo_clip_high_threshold": 0}, "0 <= low < high"),
+        ({"cispo_clip_low_threshold": float("nan")}, "must be finite"),
+        ({"cispo_clip_high_threshold": float("inf")}, "must be finite"),
+    ],
 )
-def test_main_rejects_invalid_grpo_config(config_overrides) -> None:
+def test_main_rejects_invalid_cispo_config_before_provisioning(
+    monkeypatch: pytest.MonkeyPatch, config_overrides, error
+) -> None:
     cfg = async_rl_loop.Config(log_path="gs://logs", **config_overrides)
+    build_service = MagicMock(side_effect=AssertionError("must fail before provisioning"))
+    monkeypatch.setattr(async_rl_loop, "build_service_client", build_service)
 
-    with pytest.raises(ValueError, match="must be non-negative"):
+    with pytest.raises(ValueError, match=error):
         async_rl_loop.main(
             cfg,
             rows=[],
             rollout_fn_factory=lambda _setup: lambda _sample: None,
         )
-
-
-def test_main_rejects_unknown_anchor_logp() -> None:
-    cfg = async_rl_loop.Config(log_path="gs://logs", anchor_logp="unknown")
-
-    with pytest.raises(ValueError, match="anchor_logp must be"):
-        async_rl_loop.main(
-            cfg,
-            rows=[],
-            rollout_fn_factory=lambda _setup: lambda _sample: None,
-        )
+    build_service.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -356,6 +352,172 @@ def test_main_owns_one_managed_sampling_client(
         require_dataloader_state=True,
     )
     assert events == ["sampling_client.close", "service.close"]
+
+
+def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    events: list[str] = []
+    metrics: list[dict] = []
+    datums_seen: list[tinker.Datum] = []
+    route = "AQIDBA=="
+    sampling_client = MagicMock(
+        deployment_sampler=SimpleNamespace(
+            base_url="https://deployment.test/v1",
+            model="accounts/test/deployments/model",
+        )
+    )
+    service = MagicMock(
+        trainer_job_id="trainer-test",
+        reference_trainer_job_id=None,
+        deployment_id="deployment-test",
+        max_context_length=131_072,
+    )
+    service.create_sampling_client.return_value = sampling_client
+    service.create_reference_client.side_effect = AssertionError("CISPO has no reference")
+    service.hotload_sampler_snapshot.side_effect = lambda path: events.append(
+        f"hotload:{path}"
+    )
+    policy = MagicMock()
+    policy.forward.side_effect = AssertionError("CISPO must not pre-score the batch")
+    policy.forward_backward_custom.side_effect = AssertionError("CISPO must be native")
+
+    def forward_backward(datums, loss_fn, *, loss_fn_config):
+        events.append("forward_backward")
+        assert len(datums) == 2
+        assert loss_fn == "cispo"
+        assert loss_fn_config == {
+            "clip_low_threshold": 0.0,
+            "clip_high_threshold": 5.0,
+            "ratio_log_cap": 20.0,
+        }
+        datums_seen.extend(datums)
+        return SimpleNamespace(
+            metrics={"loss:sum": 1.0},
+            loss_fn_outputs=[
+                {
+                    "logprobs": tinker.TensorData(
+                        data=[-999.0, -0.75, -999.0, -0.75, -0.75],
+                        dtype="float32",
+                        shape=[5],
+                    )
+                }
+                for _ in datums
+            ],
+        )
+
+    def optim_step(_params, *, grad_accumulation_normalization):
+        assert grad_accumulation_normalization == "num_loss_tokens"
+        events.append("optim_step")
+        return SimpleNamespace(metrics={})
+
+    def save_weights(name, **_kwargs):
+        events.append(f"save:{name}")
+        return SimpleNamespace(path=name)
+
+    policy.forward_backward.side_effect = forward_backward
+    policy.optim_step.side_effect = optim_step
+    policy.save_weights_for_sampler.side_effect = save_weights
+    checkpoints = MagicMock()
+    checkpoints.resume.return_value = None
+    setup_wandb = MagicMock()
+    build_service = MagicMock(return_value=service)
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    replacements = {
+        "setup_wandb": setup_wandb,
+        "wandb_finish": lambda **_kwargs: None,
+        "log_metrics": lambda values, **_kwargs: metrics.append(dict(values)),
+        "validate_config": lambda *_args, **_kwargs: None,
+        "resolve_router_replay_enabled": lambda **_kwargs: True,
+        "read_api_extra_headers_env": lambda: {},
+        "load_deployment_tokenizer": lambda _deployment: object(),
+        "build_service_client": build_service,
+        "TrainingCheckpoints": lambda *_args, **_kwargs: checkpoints,
+    }
+    for name, replacement in replacements.items():
+        monkeypatch.setattr(async_rl_loop, name, replacement)
+    monkeypatch.setattr(
+        async_rl_loop.ReconnectableClient,
+        "from_training_client",
+        lambda *_args, **_kwargs: policy,
+    )
+
+    def rollout_factory(setup):
+        assert setup.sample_kwargs["include_routing_matrix"] is True
+        assert setup.sample_kwargs["echo"] is False
+
+        async def rollout(row, *, sample_index):
+            return RolloutRun(
+                segments=[
+                    RolloutSample(
+                        tokens=[10, 11, 20 + row["id"], 30 + sample_index, 40, 50],
+                        logprobs=[0.0, 0.0, -0.2, 0.0, -0.4, -0.6],
+                        loss_mask=[0, 0, 1, 0, 1, 1],
+                        reward=float(sample_index),
+                        raw_logprobs=[0.0, 0.0, -1.0, 0.0, -1.0, -1.0],
+                        routing_matrices=[route] * 5,
+                    )
+                ]
+            )
+
+        return rollout
+
+    cfg = async_rl_loop.Config(
+        log_path=str(tmp_path),
+        completions_per_prompt=2,
+        prompt_groups_per_step=4,
+        pipeline_chunks_per_step=4,
+        max_concurrency_rollout_sample=8,
+        grad_accumulation_normalization="num_loss_tokens",
+        shuffle=False,
+        save_final_checkpoint=False,
+        deployment=async_rl_loop.DeployConfig(tokenizer_model="Qwen/Qwen3-1.7B"),
+    )
+    result = async_rl_loop.main(
+        cfg,
+        rows=[{"id": i} for i in range(4)],
+        rollout_fn_factory=rollout_factory,
+    )
+
+    assert result["steps"] == 1
+    assert events == [
+        "save:step-0",
+        "hotload:step-0",
+        *(["forward_backward"] * 4),
+        "optim_step",
+        "save:step-1",
+        "hotload:step-1",
+    ]
+    policy.forward.assert_not_called()
+    policy.forward_backward_custom.assert_not_called()
+    assert build_service.call_args.kwargs["reference_required"] is False
+    service.create_reference_client.assert_not_called()
+    assert len(datums_seen) == 8
+    for datum in datums_seen:
+        inputs = datum.loss_fn_inputs
+        assert set(inputs) == {"target_tokens", "logprobs", "advantages"}
+        assert list(inputs["logprobs"].data) == pytest.approx([0, -0.2, 0, -0.4, -0.6])
+        targets = list(inputs["target_tokens"].data)
+        assert targets == [11, targets[1], targets[2], 40, 50]
+        assert datum.model_input.to_ints() == [10, 11, targets[1], targets[2], 40]
+        assert datum.model_input.routing_matrices == ["", route, route, route, route]
+        advantage = (1 if targets[2] == 31 else -1) / math.sqrt(2)
+        assert list(inputs["advantages"].data) == pytest.approx(
+            [0, advantage, 0, advantage, advantage]
+        )
+    assert sorted(
+        tuple(datum.loss_fn_inputs["target_tokens"].data[1:3]) for datum in datums_seen
+    ) == [(20 + row, 30 + sample) for row in range(4) for sample in range(2)]
+    [step_metrics] = [item for item in metrics if "async/realized_training_chunks" in item]
+    assert step_metrics["async/realized_training_chunks"] == 4
+    assert step_metrics["train/loss:sum"] == 4
+    assert step_metrics["train/raw_inference_logprob_coverage"] == 1
+    assert step_metrics["train/inference_k1"] == pytest.approx(0.25)
+    assert step_metrics["train/inference_k3"] == pytest.approx(
+        math.exp(0.25) - 0.25 - 1, abs=1e-6
+    )
+    assert setup_wandb.call_args.args[1]["algorithm"] == "cispo"
+    assert setup_wandb.call_args.args[1]["trainer_loss"] == "builtin"
 
 
 def test_periodic_cursor_persistence_failure_stops_training(

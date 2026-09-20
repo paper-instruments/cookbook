@@ -6,8 +6,9 @@ algorithm's configuration.
 
 ## Generic recipe contract
 
-Treat `training/recipes/rl_loop.py` and `async_rl_loop.py` as client-side GRPO
-recipes:
+Treat `training/recipes/rl_loop.py` as the client-side GRPO recipe. This fork's
+`async_rl_loop.py` is already specialized for native CISPO; see
+[its loss contract](rl-async.md#loss-path). The synchronous GRPO recipe:
 
 1. Compute group-normalized advantages from rollout rewards.
 2. When `kl_beta > 0`, provision a reference and collect reference logprobs.
@@ -32,7 +33,7 @@ reference-trainer settings when KL is disabled instead of ignoring them. The
 client GRPO builder applies a differentiable k3 reference-KL penalty; `ref_kl`
 is not only a logging estimator.
 
-Both recipes expose the PPO anchor explicitly:
+The synchronous recipe exposes the PPO anchor explicitly:
 
 ```python
 Config(anchor_logp="old_policy")  # trainer snapshot + active TIS

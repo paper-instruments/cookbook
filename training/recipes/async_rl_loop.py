@@ -4,7 +4,7 @@
 EXPERIMENTAL -- under active development.  API surface (``Config`` field
 names, ``RolloutSetup`` shape, gate semantics) may change.  The recipe is intentionally minimal-surface: the
 only thing most users need to write is the rollout function; everything
-else (gate, advantage, optional reference KL, weight sync, TIS, pipeline chunking,
+else (gate, advantage, built-in CISPO, weight sync, pipeline chunking,
 checkpoints) is handled by ``main()``.  See
 ``skills/fireworks-training/references/rl-async.md`` for the full contract.
 
@@ -36,7 +36,7 @@ import os
 import signal
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable
 
 import tinker
 from fireworks.training.sdk.training_spec import (
@@ -71,17 +71,16 @@ from training.utils.checkpoints import (
 )
 from training.utils.dataloader import CursorDataLoader
 from training.utils.logging import ASYNC_RL_WANDB_METRIC_STEPS
-from training.utils.rl import PromptGroup
 from training.utils.rl.async_rl import (
     AsyncRLCoordinator,
     AsyncRLTelemetry,
     TrainingChunk,
     RolloutRow,
 )
-from training.utils.rl.grpo import make_grpo_loss_fn, validate_grpo_config
-from training.utils.rl.losses import combine_prompt_groups
+from training.utils.rl.losses import build_grpo_datums, combine_prompt_groups
+from training.utils.rl.observability import compute_inference_observability_metrics
 from training.utils.rl.router_replay import warn_if_full_sequence_router_replay
-from training.utils.rl.tis import TISConfig
+from training.utils.rl.tis import SAFETY_CLAMP
 from training.train_loop import DynamicFilterFn
 from training.utils.rl.rollout import RewardTransform, RolloutRun
 from training.utils.timer import elapsed_timer, flush_timing, wall_timer
@@ -110,8 +109,8 @@ class Config:
     lr_scheduler: LRSchedulerSpec = field(default_factory=default_constant_schedule)
     """Per-step LR scheduler spec for managed and local async RL runs."""
 
-    kl_beta: float = 0.001
-    """Reference-KL coefficient. Set to ``0`` to skip reference provisioning."""
+    kl_beta: float = 0.0
+    """Must be zero: this CISPO recipe does not use a reference policy."""
     completions_per_prompt: int = 4
     max_completion_tokens: int = 1024
     temperature: float = 1.0
@@ -154,25 +153,16 @@ class Config:
     grad_clip_norm: float = 0.0
     """Max gradient norm for clipping. 0 disables clipping."""
 
-    eps_clip: float = 0.2
-    """Lower/upper PPO clip epsilon used by the client-side GRPO update."""
-    eps_clip_high: float | None = None
-    """Optional asymmetric upper clip epsilon; defaults to ``eps_clip``."""
+    cispo_clip_low_threshold: float = 0.0
+    cispo_clip_high_threshold: float = 5.0
     pipeline_chunks_per_step: int = 1
     """Scheduler chunk cap per global optimizer batch.
 
     The scheduler creates balanced chunk targets and exposes the batch once its
     first target is full. Later chunks can fill while the trainer is active.
     """
-    tis: TISConfig = field(default_factory=TISConfig)
-    """TIS (Train-Inference IS) weight correction config."""
-    anchor_logp: Literal["old_policy", "rollout"] = "old_policy"
-    """PPO anchor source.
-
-    ``"old_policy"`` snapshots trainer logprobs and applies TIS against the
-    rollout behavior policy. ``"rollout"`` skips that forward, anchors PPO on
-    rollout logprobs, and makes the TIS ratio identity.
-    """
+    anchor_logp: str = "rollout"
+    """Must be ``rollout``: CISPO corrects against each token's sampling policy."""
 
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     deployment: DeployConfig = field(default_factory=DeployConfig)
@@ -314,14 +304,19 @@ def main(
     cfg = config
     if evaluation_interval < 1:
         raise ValueError("evaluation_interval must be >= 1")
-    validate_grpo_config(
-        kl_beta=cfg.kl_beta,
-        eps_clip=cfg.eps_clip,
-        eps_clip_high=cfg.eps_clip_high,
-        reference_training_shape_id=cfg.trainer.reference_training_shape_id,
-        reference_job_id=cfg.trainer.reference_job_id,
-        anchor_logp=cfg.anchor_logp,
-    )
+    if cfg.kl_beta != 0 or cfg.anchor_logp != "rollout":
+        raise ValueError("Built-in CISPO requires kl_beta=0 and anchor_logp='rollout'.")
+    if (
+        cfg.trainer.reference_training_shape_id is not None
+        or cfg.trainer.reference_job_id is not None
+    ):
+        raise ValueError("Built-in CISPO does not use a reference trainer.")
+    if not (
+        math.isfinite(cfg.cispo_clip_low_threshold)
+        and math.isfinite(cfg.cispo_clip_high_threshold)
+        and 0 <= cfg.cispo_clip_low_threshold < cfg.cispo_clip_high_threshold
+    ):
+        raise ValueError("CISPO thresholds must be finite and 0 <= low < high.")
     logger.warning(
         "async_rl_loop is EXPERIMENTAL and under active development; "
         "the Config / RolloutSetup API may change. See "
@@ -379,8 +374,11 @@ def main(
             "tokenizer_id": cfg.deployment.tokenizer_model,
             "shuffle": cfg.shuffle,
             "seed": cfg.seed,
-            "algorithm": "grpo",
-            "trainer_loss": "client",
+            "algorithm": "cispo",
+            "trainer_loss": "builtin",
+            "cispo_clip_low_threshold": cfg.cispo_clip_low_threshold,
+            "cispo_clip_high_threshold": cfg.cispo_clip_high_threshold,
+            "ratio_log_cap": SAFETY_CLAMP,
             "kl_beta": cfg.kl_beta,
             "anchor_logp": cfg.anchor_logp,
             "lr": cfg.learning_rate,
@@ -424,7 +422,7 @@ def main(
                 if cfg.cleanup_on_exit
                 else None
             ),
-            reference_required=cfg.kl_beta > 0,
+            reference_required=False,
         )
         stack.callback(service.close)
         training_client = service.create_training_client(
@@ -445,20 +443,6 @@ def main(
             job_id=service.trainer_job_id,
             service=service,
         )
-        reference = None
-        if cfg.kl_beta > 0:
-            reference_training_client = service.create_reference_client(
-                policy_client=training_client,
-            )
-            reference = ReconnectableClient.from_training_client(
-                reference_training_client,
-                base_model=cfg.base_model,
-                lora_rank=0,
-                job_id=service.reference_client_job_id,
-                service=service,
-                base_only=True,
-            )
-
         ckpt = TrainingCheckpoints(
             policy,
             service,
@@ -509,7 +493,11 @@ def main(
             remaining_rows / max(1, cfg.prompt_groups_per_step)
         )
 
-        logger.info("algorithm=grpo trainer_loss=client kl_beta=%g", cfg.kl_beta)
+        logger.info(
+            "algorithm=cispo trainer_loss=builtin clip_low=%g clip_high=%g",
+            cfg.cispo_clip_low_threshold,
+            cfg.cispo_clip_high_threshold,
+        )
 
         sample_kwargs: dict = dict(
             max_tokens=cfg.max_completion_tokens,
@@ -611,90 +599,38 @@ def main(
                     on_resolved=lambda _reason, idx=idx: row_loader.mark_resolved(idx),
                 )
 
-        def ref_forward(groups: list[PromptGroup]) -> None:
-            if reference is None:
-                return
-            all_ref_data = [d for pg in groups for d in pg.ref_data]
-            ref_fwd = reference.forward(all_ref_data, "cross_entropy")
-            idx = 0
-            for pg in groups:
-                n = len(pg.ref_data)
-                pg.ref_logprobs = [
-                    ref_fwd.loss_fn_outputs[idx + i]["logprobs"].data for i in range(n)
-                ]
-                idx += n
-
-        def fwd_bwd_batch(
-            data,
-            adv,
-            ref_lp,
-            prompt_lens,
-            inf_lp,
-            raw_inf_lp,
-            old_policy_logprobs,
-        ):
-            """Run client-side GRPO with PPO clipping, TIS, and optional reference KL.
-
-            To switch to built-in PPO or another loss, replace this call rather
-            than adding dispatch. See
-            ``skills/fireworks-training/references/rl-custom-loss.md``.
-            """
-            return policy.forward_backward_custom(
-                data,
-                make_grpo_loss_fn(
-                    advantages=adv,
-                    ref_logprobs=ref_lp,
-                    prompt_len=prompt_lens,
-                    inf_logprobs=inf_lp,
-                    old_policy_logprobs=old_policy_logprobs,
-                    kl_beta=cfg.kl_beta,
-                    eps_clip=cfg.eps_clip,
-                    eps_clip_high=cfg.eps_clip_high,
-                    tis_config=cfg.tis,
-                    raw_inf_logprobs=raw_inf_lp,
-                ),
-            )
-
         def train_chunk(chunk: TrainingChunk) -> dict[str, Any]:
-            """Run the visible GRPO forward/backward phase for one chunk."""
+            """Accumulate one chunk with the trainer's native CISPO kernel."""
 
             prompt_groups = list(chunk.groups)
-            with elapsed_timer("ref_forward"):
-                ref_forward(prompt_groups)
-
-            data, adv, ref_lp, prompt_lens, inf_lp, raw_inf_lp = combine_prompt_groups(
+            data, adv, _ref_lp, prompt_lens, inf_lp, raw_inf_lp = combine_prompt_groups(
                 prompt_groups,
                 include_raw=True,
             )
-            if cfg.anchor_logp == "old_policy":
-                with elapsed_timer("old_policy_forward"):
-                    old_policy_fwd = policy.forward(data, "cross_entropy")
-                    old_policy_logprobs = [
-                        old_policy_fwd.loss_fn_outputs[i]["logprobs"].data
-                        for i in range(len(data))
-                    ]
-            else:
-                if len(inf_lp) != len(data):
-                    raise ValueError(
-                        "anchor_logp='rollout' requires one rollout_logprobs "
-                        f"row per datum; got {len(inf_lp)} rows for {len(data)} datums."
-                    )
-                if any(not row for row in inf_lp):
-                    raise ValueError(
-                        "anchor_logp='rollout' requires non-empty rollout_logprobs."
-                    )
-                old_policy_logprobs = inf_lp
-
+            # Both logprob inputs are the behavior policy, so the preparation
+            # helper applies only the token mask, not a second IS correction.
+            datums = build_grpo_datums(data, adv, inf_lp, inf_lp, prompt_lens)
             with elapsed_timer("fwd_bwd"):
-                fwd_bwd_result = fwd_bwd_batch(
-                    data,
-                    adv,
-                    ref_lp,
-                    prompt_lens,
-                    inf_lp,
-                    raw_inf_lp,
-                    old_policy_logprobs,
+                fwd_bwd_result = policy.forward_backward(
+                    datums,
+                    "cispo",
+                    loss_fn_config={
+                        "clip_low_threshold": cfg.cispo_clip_low_threshold,
+                        "clip_high_threshold": cfg.cispo_clip_high_threshold,
+                        # Preserve the previous TIS numerical floor as well as
+                        # its upper cap; exp(-20) is not the same as zero.
+                        "ratio_log_cap": SAFETY_CLAMP,
+                    },
                 )
+            fwd_bwd_result.metrics.update(
+                compute_inference_observability_metrics(
+                    data,
+                    [output["logprobs"].to_torch() for output in fwd_bwd_result.loss_fn_outputs],
+                    raw_inf_lp,
+                    prompt_lens,
+                    "cispo",
+                )
+            )
             return {
                 "prompt_groups": prompt_groups,
                 "fwd_bwd_result": fwd_bwd_result,
@@ -746,7 +682,7 @@ def main(
                 training_chunks_per_step=cfg.pipeline_chunks_per_step,
                 max_head_off_policy_versions=cfg.max_head_offpolicy_versions,
                 max_concurrent_rollouts=cfg.max_concurrency_rollout_sample,
-                with_reference=(reference is not None),
+                with_reference=False,
                 router_replay_completion_only=cfg.router_replay_completion_only,
                 min_group_size=cfg.min_group_size,
                 max_incomplete_group_retries=cfg.max_incomplete_group_retries,
