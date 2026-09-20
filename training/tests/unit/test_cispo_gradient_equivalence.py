@@ -42,21 +42,50 @@ def test_four_uneven_chunks_preserve_the_global_nonzero_gradient_mean():
         [_case(2.0, [0.0, 0.0, 0.0, -1.0], [0, 0, 1, 1])],
     ]
     cases = [case for chunk in chunks for case in chunk]
-    accumulated_grpo = torch.cat([g for chunk in chunks for g in _grpo_gradients(chunk)])
-    accumulated_cispo = torch.cat(
-        [g for chunk in chunks for g in _cispo_reference_gradients(chunk)]
-    )
-    full_batch_grpo = torch.cat(_grpo_gradients(cases))
-    full_batch_cispo = torch.cat(_cispo_reference_gradients(cases))
-
-    torch.testing.assert_close(accumulated_grpo, full_batch_grpo, rtol=1e-6, atol=0)
-    torch.testing.assert_close(accumulated_cispo, full_batch_cispo, rtol=1e-6, atol=0)
-    assert torch.count_nonzero(accumulated_grpo) == 7
-    assert torch.count_nonzero(accumulated_cispo) == 7
+    chunk_token_counts = [
+        sum(sum(case[0].loss_fn_inputs["weights"].data) for case in chunk if case[1] != 0)
+        for chunk in chunks
+    ]
+    assert chunk_token_counts == [2, 3, 0, 2]
     # SDK documents nonzero-gradient tokens, not all eight sampled tokens.
-    torch.testing.assert_close(
-        accumulated_grpo.sum() / 7, accumulated_cispo.sum() / 7, rtol=1e-6, atol=0,
-    )
+    denominator = sum(chunk_token_counts)
+    sampled_tokens = sum(sum(case[0].loss_fn_inputs["weights"].data) for case in cases)
+    assert sampled_tokens == 8
+
+    # Isolate accumulation math from float32 reduction-order rounding; the
+    # other tests retain float32 coverage, including its underflow counterexample.
+    parameters = torch.zeros(2, dtype=torch.float64, requires_grad=True)
+    full_batch_loss = _shared_parameter_loss(cases, parameters, _grpo_loss)
+    (full_batch_loss / denominator).backward()
+    expected = parameters.grad.clone()
+
+    for loss_fn in (_grpo_loss, _cispo_reference_loss):
+        parameters = torch.zeros(2, dtype=torch.float64, requires_grad=True)
+        full_batch_loss = _shared_parameter_loss(cases, parameters, loss_fn)
+        (full_batch_loss / denominator).backward()
+        torch.testing.assert_close(parameters.grad, expected, rtol=1e-12, atol=0)
+
+        parameters = torch.zeros(2, dtype=torch.float64, requires_grad=True)
+        chunk_gradients = []
+        for chunk in chunks:
+            previous = (
+                torch.zeros_like(parameters)
+                if parameters.grad is None else parameters.grad.clone()
+            )
+            _shared_parameter_loss(chunk, parameters, loss_fn).backward()
+            chunk_gradients.append(parameters.grad - previous)
+
+        torch.testing.assert_close(
+            parameters.grad / denominator, expected, rtol=1e-12, atol=0,
+        )
+
+        # Uneven lengths and a zero-advantage chunk distinguish these mistakes.
+        chunk_means = [
+            gradient / max(count, 1)
+            for gradient, count in zip(chunk_gradients, chunk_token_counts, strict=True)
+        ]
+        assert not torch.allclose(torch.stack(chunk_means).mean(dim=0), expected)
+        assert not torch.allclose(parameters.grad / sampled_tokens, expected)
 
 
 def test_ratio_log_floor_is_required_for_extreme_first_step_equivalence():
@@ -112,8 +141,12 @@ def _case(advantage, log_ratios, mask=None):
 
 
 def _grpo_gradients(cases, *, old_rows=None):
+    logprobs = [case[2].clone().requires_grad_() for case in cases]
+    return torch.autograd.grad(_grpo_loss(cases, logprobs, old_rows=old_rows), logprobs)
+
+
+def _grpo_loss(cases, logprobs, *, old_rows=None):
     data, advantages, currents, behavior, prompt_lens = zip(*cases, strict=True)
-    logprobs = [current.clone().requires_grad_() for current in currents]
     loss_fn = make_grpo_loss_fn(
         advantages=list(advantages), ref_logprobs=[], prompt_len=list(prompt_lens),
         inf_logprobs=list(behavior),
@@ -121,26 +154,41 @@ def _grpo_gradients(cases, *, old_rows=None):
         kl_beta=0.0, eps_clip=0.2, tis_config=TISConfig(cap=5.0),
     )
     loss, _ = loss_fn(list(data), logprobs)
-    return torch.autograd.grad(loss, logprobs)
+    return loss
 
 
 def _cispo_reference_gradients(cases, *, ratio_log_cap=SAFETY_CLAMP):
-    data, advantages, currents, behavior, prompt_lens = zip(*cases, strict=True)
+    logprobs = [case[2].clone().requires_grad_() for case in cases]
+    loss = _cispo_reference_loss(cases, logprobs, ratio_log_cap=ratio_log_cap)
+    return torch.autograd.grad(loss, logprobs)
+
+
+def _cispo_reference_loss(cases, logprobs, *, ratio_log_cap=SAFETY_CLAMP):
+    data, advantages, _currents, behavior, prompt_lens = zip(*cases, strict=True)
     datums = build_grpo_datums(
         data=list(data), advantages=list(advantages),
         old_policy_logprobs=list(behavior), inf_logprobs=list(behavior),
         prompt_lens=list(prompt_lens), tis_config=TISConfig(cap=1.0),
     )
-    logprobs = [current.clone().requires_grad_() for current in currents]
     loss = torch.tensor(0.0)
     for original, datum, current in zip(data, datums, logprobs, strict=True):
         assert datum.model_input is original.model_input
         assert datum.loss_fn_inputs["target_tokens"].data == original.loss_fn_inputs["target_tokens"].data
-        behavior_logprobs = torch.tensor(datum.loss_fn_inputs["logprobs"].data)
-        masked_advantages = torch.tensor(datum.loss_fn_inputs["advantages"].data)
+        behavior_logprobs = torch.tensor(datum.loss_fn_inputs["logprobs"].data, dtype=current.dtype)
+        masked_advantages = torch.tensor(datum.loss_fn_inputs["advantages"].data, dtype=current.dtype)
         log_ratio = current - behavior_logprobs
         if ratio_log_cap is not None:
             log_ratio = log_ratio.clamp(-ratio_log_cap, ratio_log_cap)
         weight = log_ratio.exp().clamp(0.0, 5.0).detach()
         loss = loss - (weight * current * masked_advantages).sum()
-    return torch.autograd.grad(loss, logprobs)
+    return loss
+
+
+def _shared_parameter_loss(cases, parameters, loss_fn):
+    # At zero parameters, old/current scores match; both parameters influence
+    # every datum, with distinct token Jacobians rather than independent leaves.
+    logprobs = [
+        case[2].to(parameters.dtype) + parameters[0] + parameters[1] * torch.arange(len(case[2]))
+        for case in cases
+    ]
+    return loss_fn(cases, logprobs)
