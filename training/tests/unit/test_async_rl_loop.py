@@ -354,8 +354,9 @@ def test_main_owns_one_managed_sampling_client(
     assert events == ["sampling_client.close", "service.close"]
 
 
+@pytest.mark.parametrize("custom_advantages", [False, True], ids=["default", "mean_only"])
 def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
+    monkeypatch: pytest.MonkeyPatch, tmp_path, custom_advantages: bool
 ) -> None:
     events: list[str] = []
     metrics: list[dict] = []
@@ -473,12 +474,22 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         save_final_checkpoint=False,
         deployment=async_rl_loop.DeployConfig(tokenizer_model="Qwen/Qwen3-1.7B"),
     )
+    advantage_calls: list[list[float]] = []
+
+    def mean_centered_advantages(rewards):
+        advantage_calls.append(list(rewards))
+        mean_reward = sum(rewards) / len(rewards)
+        return [reward - mean_reward for reward in rewards]
+
     result = async_rl_loop.main(
         cfg,
         rows=[{"id": i} for i in range(4)],
         rollout_fn_factory=rollout_factory,
+        **({"advantage_fn": mean_centered_advantages} if custom_advantages else {}),
     )
 
+    assert len(advantage_calls) == (4 if custom_advantages else 0)
+    assert all(sorted(rewards) == [0.0, 1.0] for rewards in advantage_calls)
     assert result["steps"] == 1
     assert events == [
         "save:step-0",
@@ -501,7 +512,8 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         assert targets == [11, targets[1], targets[2], 40, 50]
         assert datum.model_input.to_ints() == [10, 11, targets[1], targets[2], 40]
         assert datum.model_input.routing_matrices == ["", route, route, route, route]
-        advantage = (1 if targets[2] == 31 else -1) / math.sqrt(2)
+        advantage_scale = 0.5 if custom_advantages else 1 / math.sqrt(2)
+        advantage = (1 if targets[2] == 31 else -1) * advantage_scale
         assert list(inputs["advantages"].data) == pytest.approx(
             [0, advantage, 0, advantage, advantage]
         )

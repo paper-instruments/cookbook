@@ -98,6 +98,14 @@ segment rewards remain unchanged. Evaluation bypasses this training hook.
 The existing `rollout/raw_reward` metric means pre-filter reward; with this
 hook it reports shaped rewards, not the original environment scores.
 
+The dedicated recipe also accepts `advantage_fn(rewards) -> list[float]` in
+`main()`. It receives one reward per surviving run after `reward_transform`
+and returns one advantage per run, before dynamic filtering. The default
+remains `compute_advantages` (group-mean subtraction and group-standard-deviation
+normalization). A custom estimator changes only these advantages, which are
+broadcast to the run's trajectories; native CISPO, masks, routing, chunking,
+and evaluation behavior are unchanged.
+
 `RolloutSetup` contains the tokenizer, tokenizer ID, sampling kwargs, inference
 base URL, API key, deployment model, group size, caller-provided `extras`, and
 the recipe-owned sampling client. The dedicated recipe supplies its managed

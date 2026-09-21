@@ -70,6 +70,7 @@ from training.utils.checkpoints import (
     validate_warm_start_config,
 )
 from training.utils.dataloader import CursorDataLoader
+from training.utils.data import compute_advantages
 from training.utils.logging import ASYNC_RL_WANDB_METRIC_STEPS
 from training.utils.rl.async_rl import (
     AsyncRLCoordinator,
@@ -83,6 +84,7 @@ from training.utils.rl.router_replay import warn_if_full_sequence_router_replay
 from training.utils.rl.tis import SAFETY_CLAMP
 from training.train_loop import DynamicFilterFn
 from training.utils.rl.rollout import RewardTransform, RolloutRun
+from training.utils.rl.rollout.group_assembler import AdvantageFn
 from training.utils.timer import elapsed_timer, flush_timing, wall_timer
 
 logger = logging.getLogger(__name__)
@@ -285,6 +287,7 @@ def main(
     rollout_fn_factory: RolloutFnFactory,
     dynamic_filter_fn: DynamicFilterFn | None = None,
     reward_transform: RewardTransform | None = None,
+    advantage_fn: AdvantageFn = compute_advantages,
     evaluation_fn: RolloutEvaluationFn | None = None,
     evaluation_interval: int = 1,
     rows: list[dict] | None = None,
@@ -298,6 +301,10 @@ def main(
     ``rollout_fn(sample_prompt) -> RolloutRun | None`` is invoked
     ``completions_per_prompt`` times per dataset row (each invocation is
     one trajectory draw against the inference deployment).
+
+    ``advantage_fn(rewards)`` computes one advantage per surviving rollout
+    run after ``reward_transform``. The default keeps group-standardized
+    advantages; callers can supply another group-relative estimator.
 
     Remote trainer and sampler setup is owned by the SDK-managed Tinker path.
     """
@@ -688,6 +695,7 @@ def main(
                 max_incomplete_group_retries=cfg.max_incomplete_group_retries,
                 dynamic_filter_fn=dynamic_filter_fn,
                 reward_transform=reward_transform,
+                advantage_fn=advantage_fn,
                 global_step=step_offset,
                 resolved_rows_offset=prior_rows_consumed,
                 resolved_rows_fn=lambda: row_loader.data_consumed,
