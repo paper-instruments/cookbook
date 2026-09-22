@@ -129,6 +129,15 @@ state, but resets cookbook-owned step and dataset cursor to 0. Use
 `warm_start_from_adapter` when you specifically want LoRA weights only and a
 fresh optimizer.
 
+For dedicated async RL continuation in a **new** job, explicitly set
+`init_from_checkpoint="<prior_job_id>:step-N"` and `resume_recipe_state=True`.
+Copy that checkpoint's paired entry from the old `dataloader.json` into the new
+`log_path/dataloader.json` before launch. Missing metadata fails before loading
+trainer state; ordinary initialization remains unchanged. Keep the same dataset
+revision/order, shuffle seed, and **total** epoch budget. The restored cursor is
+the contiguous resolved prefix, not an exact-once ledger of out-of-order groups;
+speculative work is regenerated and already-trained groups beyond it may repeat.
+
 ---
 
 ## `output_model_id` validation

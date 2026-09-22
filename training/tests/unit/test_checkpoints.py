@@ -327,6 +327,38 @@ class TestResume:
         client.resolve_checkpoint_path.assert_called_once_with("step-3")
         client.load_state_with_optimizer.assert_called_once_with("path://self/step-3")
 
+    def test_cross_job_continuation_restores_paired_step_and_cursor(self, log_dir):
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as f:
+            json.dump({"step-4": 257}, f)
+        ckpt, client, _ = _make(log_dir, fw_rows=[])
+
+        info = ckpt.resume(
+            init_from_checkpoint="previous-job:step-4", resume_recipe_state=True
+        )
+
+        assert info == ResumeInfo(
+            step=4, data_consumed=257, source_job_id="previous-job"
+        )
+        client.resolve_checkpoint_path.assert_called_once_with(
+            "step-4", source_job_id="previous-job"
+        )
+        client.load_state_with_optimizer.assert_called_once_with(
+            "path://previous-job/step-4"
+        )
+
+    def test_cross_job_continuation_requires_paired_cursor_before_loading(
+        self, log_dir
+    ):
+        ckpt, client, _ = _make(log_dir, fw_rows=[])
+
+        with pytest.raises(RuntimeError, match="no matching dataloader state"):
+            ckpt.resume(
+                init_from_checkpoint="previous-job:step-4", resume_recipe_state=True
+            )
+
+        client.resolve_checkpoint_path.assert_not_called()
+        client.load_state_with_optimizer.assert_not_called()
+
     def test_same_trainer_required_cursor_fails_before_state_load(self, log_dir):
         ckpt, client, _ = _make(log_dir, fw_rows=[])
 

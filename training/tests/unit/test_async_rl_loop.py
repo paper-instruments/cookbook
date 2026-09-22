@@ -12,6 +12,7 @@ import pytest
 import tinker
 
 from training.recipes import async_rl_loop
+from training.utils.checkpoints import ResumeInfo
 from training.utils.rl.rollout import RolloutRun, RolloutSample
 
 
@@ -350,17 +351,35 @@ def test_main_owns_one_managed_sampling_client(
         init_from_checkpoint=None,
         warm_start_from_adapter=None,
         require_dataloader_state=True,
+        resume_recipe_state=False,
     )
     assert events == ["sampling_client.close", "service.close"]
 
 
-@pytest.mark.parametrize("custom_advantages", [False, True], ids=["default", "mean_only"])
+@pytest.mark.parametrize(
+    ("custom_advantages", "fail_forward", "continuation"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+    ],
+    ids=["default", "mean_only", "backend_failure", "continuation"],
+)
 def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
-    monkeypatch: pytest.MonkeyPatch, tmp_path, custom_advantages: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    caplog,
+    custom_advantages: bool,
+    fail_forward: bool,
+    continuation: bool,
 ) -> None:
+    caplog.set_level("INFO")
     events: list[str] = []
     metrics: list[dict] = []
     datums_seen: list[tinker.Datum] = []
+    sampled_positions: list[tuple[int, int]] = []
+    step_offset = 4 if continuation else 0
     route = "AQIDBA=="
     sampling_client = MagicMock(
         deployment_sampler=SimpleNamespace(
@@ -382,6 +401,7 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
     policy = MagicMock()
     policy.forward.side_effect = AssertionError("CISPO must not pre-score the batch")
     policy.forward_backward_custom.side_effect = AssertionError("CISPO must be native")
+    backend_error = RuntimeError("forward_backward failed")
 
     def forward_backward(datums, loss_fn, *, loss_fn_config):
         events.append("forward_backward")
@@ -393,6 +413,8 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
             "ratio_log_cap": 20.0,
         }
         datums_seen.extend(datums)
+        if fail_forward:
+            raise backend_error
         return SimpleNamespace(
             metrics={"loss:sum": 1.0},
             loss_fn_outputs=[
@@ -420,7 +442,11 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
     policy.optim_step.side_effect = optim_step
     policy.save_weights_for_sampler.side_effect = save_weights
     checkpoints = MagicMock()
-    checkpoints.resume.return_value = None
+    checkpoints.resume.return_value = (
+        ResumeInfo(step=4, data_consumed=2, source_job_id="previous-job")
+        if continuation
+        else None
+    )
     setup_wandb = MagicMock()
     build_service = MagicMock(return_value=service)
     monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
@@ -447,7 +473,8 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         assert setup.sample_kwargs["include_routing_matrix"] is True
         assert setup.sample_kwargs["echo"] is False
 
-        async def rollout(row, *, sample_index):
+        async def rollout(row, *, sample_index, cursor_index, epoch):
+            sampled_positions.append((cursor_index, epoch))
             return RolloutRun(
                 segments=[
                     RolloutSample(
@@ -471,6 +498,9 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         max_concurrency_rollout_sample=8,
         grad_accumulation_normalization="num_loss_tokens",
         shuffle=False,
+        epochs=2 if continuation else 1,
+        init_from_checkpoint="previous-job:step-4" if continuation else None,
+        resume_recipe_state=continuation,
         save_final_checkpoint=False,
         deployment=async_rl_loop.DeployConfig(tokenizer_model="Qwen/Qwen3-1.7B"),
     )
@@ -481,23 +511,47 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         mean_reward = sum(rewards) / len(rewards)
         return [reward - mean_reward for reward in rewards]
 
-    result = async_rl_loop.main(
-        cfg,
-        rows=[{"id": i} for i in range(4)],
-        rollout_fn_factory=rollout_factory,
+    kwargs = {
+        "rows": [{"id": i} for i in range(3 if continuation else 4)],
+        "rollout_fn_factory": rollout_factory,
         **({"advantage_fn": mean_centered_advantages} if custom_advantages else {}),
-    )
+    }
+    if fail_forward:
+        with pytest.raises(RuntimeError) as caught:
+            async_rl_loop.main(cfg, **kwargs)
+        assert caught.value is backend_error
+        policy.optim_step.assert_not_called()
+        assert events == ["save:step-0", "hotload:step-0", "forward_backward"]
+        phase_logs = [m for m in caplog.messages if m.startswith("Training phase end")]
+        assert len(phase_logs) == 3
+        assert "phase=datum_build" in phase_logs[1] and "status=ok" in phase_logs[1]
+        assert "phase=fwd_bwd" in phase_logs[2] and "status=error" in phase_logs[2]
+        assert not any("async/realized_training_chunks" in item for item in metrics)
+        return
+
+    result = async_rl_loop.main(cfg, **kwargs)
 
     assert len(advantage_calls) == (4 if custom_advantages else 0)
     assert all(sorted(rewards) == [0.0, 1.0] for rewards in advantage_calls)
-    assert result["steps"] == 1
+    assert result["steps"] == step_offset + 1
+    checkpoints.resume.assert_called_once_with(
+        init_from_checkpoint=cfg.init_from_checkpoint,
+        warm_start_from_adapter=None,
+        require_dataloader_state=True,
+        resume_recipe_state=continuation,
+    )
+    assert sorted(sampled_positions) == (
+        [(2, 0)] * 2 + [(3, 1)] * 2 + [(4, 1)] * 2 + [(5, 1)] * 2
+        if continuation
+        else [(i, 0) for i in range(4) for _ in range(2)]
+    )
     assert events == [
-        "save:step-0",
-        "hotload:step-0",
+        f"save:step-{step_offset}",
+        f"hotload:step-{step_offset}",
         *(["forward_backward"] * 4),
         "optim_step",
-        "save:step-1",
-        "hotload:step-1",
+        f"save:step-{step_offset + 1}",
+        f"hotload:step-{step_offset + 1}",
     ]
     policy.forward.assert_not_called()
     policy.forward_backward_custom.assert_not_called()
@@ -517,11 +571,32 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         assert list(inputs["advantages"].data) == pytest.approx(
             [0, advantage, 0, advantage, advantage]
         )
+    expected_rows = [2, 0, 1, 2] if continuation else list(range(4))
     assert sorted(
         tuple(datum.loss_fn_inputs["target_tokens"].data[1:3]) for datum in datums_seen
-    ) == [(20 + row, 30 + sample) for row in range(4) for sample in range(2)]
+    ) == sorted((20 + row, 30 + sample) for row in expected_rows for sample in range(2))
     [step_metrics] = [item for item in metrics if "async/realized_training_chunks" in item]
     assert step_metrics["async/realized_training_chunks"] == 4
+    phases = (
+        "chunk_combine",
+        "datum_build",
+        "fwd_bwd",
+        "postprocess",
+        "optim_prepare",
+        "optim_step",
+    )
+    assert all(step_metrics[f"perf/{phase}_time"] >= 0 for phase in phases)
+    assert step_metrics["perf/train_worker_time"] == pytest.approx(
+        sum(step_metrics[f"perf/{phase}_time"] for phase in phases)
+        + step_metrics["perf/train_worker_unphased_time"]
+    )
+    assert step_metrics["perf/train_accounting_error_time"] == pytest.approx(
+        0, abs=1e-7
+    )
+    assert step_metrics["perf/train_worker_unphased_time"] >= 0
+    chunk_logs = [m for m in caplog.messages if m.startswith("Training chunk ")]
+    assert len(chunk_logs) == 4
+    assert all("groups=1 datums=2 target_positions=10" in m for m in chunk_logs)
     assert step_metrics["train/loss:sum"] == 4
     assert step_metrics["train/raw_inference_logprob_coverage"] == 1
     assert step_metrics["train/inference_k1"] == pytest.approx(0.25)

@@ -18,11 +18,12 @@ from training.utils.losses import (
     perplexity_from_nll,
 )
 from training.utils.rl.common import (
+    _get_loss_mask,
     _normalize_prompt_lens,
     align_sample_logprobs_to_target_tokens,
 )
 from training.utils.rl.losses import build_grpo_datums
-from training.utils.rl.tis import TISConfig
+from training.utils.rl.tis import TISConfig, compute_tis_weight
 from training.utils.supervised import build_datum_from_token_mask
 
 
@@ -313,6 +314,86 @@ class TestBuildGRPODatums:
         assert datum.loss_fn_inputs["advantages"].data == pytest.approx(
             [0.0, 3.0, 3.0]
         )
+
+    def test_bulk_scalar_extraction_matches_original_float32_bytes(self):
+        cases = [
+            (
+                5.366846413747318,
+                [1, 1, 0, 1],
+                [0.0, -0.5, -0.25, -0.125],
+                [0.6699520696756494, -1.5, None, -0.625],
+                1,
+                TISConfig(cap=5.0),
+            ),
+            (
+                -0.987654321,
+                [1, 1, 1, 0, 1, 0],
+                [-0.2, -0.4, -0.6, -0.8, -1.0, -1.2],
+                [-0.2, -0.4, -1.6, None, -0.5, None],
+                3,
+                TISConfig(cap=3.0, icepop_threshold=2.0),
+            ),
+            (
+                -0.0,
+                [1, 0, 1],
+                [-2.0, -1.0, -0.5],
+                [-2.5, None, -0.25],
+                1,
+                TISConfig(cap=2.0),
+            ),
+            (
+                -2.0,
+                [0, 1, 0, 1],
+                [-1.0, -0.5, -0.25, -0.125],
+                [-1.0, -1.5, None, -0.625],
+                2,
+                TISConfig(cap=4.0, level="sequence"),
+            ),
+        ]
+
+        for advantage, masks, old_policy, behavior, prompt_len, tis_config in cases:
+            datum = build_datum_from_token_mask(
+                token_ids=list(range(99, 100 + len(masks))),
+                token_mask=[0, *masks],
+            ).datum
+            actual = build_grpo_datums(
+                [datum], [advantage], [old_policy], [behavior], [prompt_len], tis_config
+            )[0].loss_fn_inputs["advantages"]
+
+            response_start = max(0, prompt_len - 1)
+            loss_mask = _get_loss_mask(
+                datum,
+                response_start,
+                len(masks) - response_start,
+                torch.float32,
+                torch.device("cpu"),
+            )
+            active = loss_mask > 0.5
+            response_behavior = [
+                0.0 if value is None else value for value in behavior[response_start:]
+            ]
+            tis_weight_active, _ = compute_tis_weight(
+                torch.tensor(old_policy[response_start:])[active],
+                torch.tensor(response_behavior)[active],
+                tis_config,
+            )
+            tis_weight = torch.ones_like(loss_mask)
+            tis_weight[active] = tis_weight_active
+            expected = [0.0] * response_start
+            for position in range(len(loss_mask)):
+                expected.append(
+                    float(
+                        advantage
+                        * tis_weight[position].item()
+                        * loss_mask[position].item()
+                    )
+                )
+
+            assert actual.dtype == "float32"
+            assert actual.shape == [len(masks)]
+            assert torch.tensor(actual.data, dtype=torch.float32).numpy().tobytes() == (
+                torch.tensor(expected, dtype=torch.float32).numpy().tobytes()
+            )
 
 
 class TestBatchDPOLoss:

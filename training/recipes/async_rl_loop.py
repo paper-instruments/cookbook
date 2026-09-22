@@ -85,7 +85,7 @@ from training.utils.rl.tis import SAFETY_CLAMP
 from training.train_loop import DynamicFilterFn
 from training.utils.rl.rollout import RewardTransform, RolloutRun
 from training.utils.rl.rollout.group_assembler import AdvantageFn
-from training.utils.timer import elapsed_timer, flush_timing, wall_timer
+from training.utils.timer import elapsed_timer, flush_timing, training_phase, wall_timer
 
 logger = logging.getLogger(__name__)
 
@@ -175,8 +175,13 @@ class Config:
     """Clean up SDK-created trainer/deployment resources on close."""
 
     init_from_checkpoint: str | None = None
-    """Resume from prior checkpoint; bare name = this job, ``"job:name"``
-    = cross-job."""
+    """Load DCP state; ``job:step-N`` identifies a checkpoint from another job."""
+    resume_recipe_state: bool = False
+    """Continue step/cursor with explicit DCP initialization instead of resetting.
+
+    Requires the matching checkpoint entry in log_path/dataloader.json and the
+    same dataset order, shuffle seed, and total epoch budget.
+    """
     warm_start_from_adapter: str | None = None
     """Initialize LoRA weights from a PEFT adapter with fresh optimizer state.
 
@@ -351,6 +356,8 @@ def main(
         init_from_checkpoint=cfg.init_from_checkpoint,
         lora_rank=cfg.lora_rank,
     )
+    if cfg.resume_recipe_state and not cfg.init_from_checkpoint:
+        raise ValueError("resume_recipe_state requires init_from_checkpoint")
     if not cfg.deployment.tokenizer_model:
         raise ValueError("deployment.tokenizer_model is required.")
     if cfg.completions_per_prompt < 2:
@@ -463,6 +470,7 @@ def main(
             init_from_checkpoint=cfg.init_from_checkpoint,
             warm_start_from_adapter=cfg.warm_start_from_adapter,
             require_dataloader_state=True,
+            resume_recipe_state=cfg.resume_recipe_state,
         )
         step_offset = resume_info.step if resume_info else 0
         if step_offset:
@@ -609,15 +617,29 @@ def main(
         def train_chunk(chunk: TrainingChunk) -> dict[str, Any]:
             """Accumulate one chunk with the trainer's native CISPO kernel."""
 
-            prompt_groups = list(chunk.groups)
-            data, adv, _ref_lp, prompt_lens, inf_lp, raw_inf_lp = combine_prompt_groups(
-                prompt_groups,
-                include_raw=True,
-            )
+            with training_phase(
+                "chunk_combine", batch=chunk.batch_id, chunk=chunk.index
+            ):
+                prompt_groups = list(chunk.groups)
+                data, adv, _ref_lp, prompt_lens, inf_lp, raw_inf_lp = (
+                    combine_prompt_groups(
+                        prompt_groups,
+                        include_raw=True,
+                    )
+                )
             # Both logprob inputs are the behavior policy, so the preparation
             # helper applies only the token mask, not a second IS correction.
-            datums = build_grpo_datums(data, adv, inf_lp, inf_lp, prompt_lens)
-            with elapsed_timer("fwd_bwd"):
+            with training_phase("datum_build", batch=chunk.batch_id, chunk=chunk.index):
+                datums = build_grpo_datums(data, adv, inf_lp, inf_lp, prompt_lens)
+                logger.info(
+                    "Training chunk batch=%s chunk=%s groups=%s datums=%s target_positions=%s",
+                    chunk.batch_id,
+                    chunk.index,
+                    len(prompt_groups),
+                    len(datums),
+                    sum(d.loss_fn_inputs["target_tokens"].shape[0] for d in datums),
+                )
+            with training_phase("fwd_bwd", batch=chunk.batch_id, chunk=chunk.index):
                 fwd_bwd_result = policy.forward_backward(
                     datums,
                     "cispo",
@@ -629,15 +651,19 @@ def main(
                         "ratio_log_cap": SAFETY_CLAMP,
                     },
                 )
-            fwd_bwd_result.metrics.update(
-                compute_inference_observability_metrics(
-                    data,
-                    [output["logprobs"].to_torch() for output in fwd_bwd_result.loss_fn_outputs],
-                    raw_inf_lp,
-                    prompt_lens,
-                    "cispo",
+            with training_phase("postprocess", batch=chunk.batch_id, chunk=chunk.index):
+                fwd_bwd_result.metrics.update(
+                    compute_inference_observability_metrics(
+                        data,
+                        [
+                            output["logprobs"].to_torch()
+                            for output in fwd_bwd_result.loss_fn_outputs
+                        ],
+                        raw_inf_lp,
+                        prompt_lens,
+                        "cispo",
+                    )
                 )
-            )
             return {
                 "prompt_groups": prompt_groups,
                 "fwd_bwd_result": fwd_bwd_result,
@@ -646,16 +672,17 @@ def main(
         def optimizer_step(step: int) -> dict[str, Any]:
             """Apply exactly one optimizer mutation for one rollout batch."""
 
-            step_lr = compute_lr(
-                lr_scheduler,
-                step=step,
-                base_lr=cfg.learning_rate,
-                total_steps=total_steps_estimate,
-            )
-            adam_kwargs = dict(DEFAULT_ADAM)
-            adam_kwargs["grad_clip_norm"] = cfg.grad_clip_norm
-            adam_params = tinker.AdamParams(learning_rate=step_lr, **adam_kwargs)
-            with elapsed_timer("optim_step"):
+            with training_phase("optim_prepare", batch=step):
+                step_lr = compute_lr(
+                    lr_scheduler,
+                    step=step,
+                    base_lr=cfg.learning_rate,
+                    total_steps=total_steps_estimate,
+                )
+                adam_kwargs = dict(DEFAULT_ADAM)
+                adam_kwargs["grad_clip_norm"] = cfg.grad_clip_norm
+                adam_params = tinker.AdamParams(learning_rate=step_lr, **adam_kwargs)
+            with training_phase("optim_step", batch=step):
                 result = policy.optim_step(
                     adam_params,
                     grad_accumulation_normalization=cfg.grad_accumulation_normalization,

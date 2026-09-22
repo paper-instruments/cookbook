@@ -300,7 +300,11 @@ when resume is required. A serverless bare checkpoint name resumes trainer
 state and the dataset cursor for the current run; a dedicated explicit full
 resume uses `<current_job_id>:<checkpoint>`. Dedicated bare/path/cross-job and
 serverless cross-run references restore trainer weights and optimizer state but
-reset the cookbook-owned recipe step and dataset cursor.
+reset the cookbook-owned recipe step and dataset cursor by default. To continue
+a dedicated cross-job `step-N` checkpoint, set `resume_recipe_state=True` and
+provide its matching `dataloader.json` entry in the new `log_path`. Keep the
+dataset, shuffle seed, and total epoch budget unchanged. This restores the
+durable prefix, not interrupted rollouts or out-of-order in-memory work.
 
 ## Metrics and tuning
 

@@ -463,6 +463,7 @@ class TrainingCheckpoints:
         init_from_checkpoint: str | None = None,
         warm_start_from_adapter: str | None = None,
         require_dataloader_state: bool = False,
+        resume_recipe_state: bool = False,
     ) -> ResumeInfo | None:
         """Determine resume state and load weights into the live client.
 
@@ -472,6 +473,8 @@ class TrainingCheckpoints:
            current-job-qualified ref or serverless current-run ref resumes the
            recipe step/cursor; dedicated bare/path/cross-job and serverless
            cross-run refs restore trainer state but reset the recipe position.
+           ``resume_recipe_state`` explicitly preserves the step and paired local
+           cursor for a dedicated ``step-N`` checkpoint from another job.
         2. Newest resumable row on the control plane — auto-resume.
         3. ``warm_start_from_adapter`` — HF PEFT adapter (weights only).
         4. Fresh start (returns ``None``).
@@ -481,6 +484,8 @@ class TrainingCheckpoints:
             init_from_checkpoint=init_from_checkpoint,
             lora_rank=self._lora_rank,
         )
+        if resume_recipe_state and not init_from_checkpoint:
+            raise ValueError("resume_recipe_state requires init_from_checkpoint")
 
         if init_from_checkpoint:
             ref = _parse_explicit_checkpoint_ref(
@@ -488,15 +493,29 @@ class TrainingCheckpoints:
                 serverless=self._serverless,
                 trainer_id=self._trainer_id,
             )
-            if ref.restore_recipe_state:
+            if resume_recipe_state and not re.fullmatch(
+                r"step-\d+", ref.checkpoint_name
+            ):
+                raise ValueError(
+                    "resume_recipe_state requires a named step-N checkpoint"
+                )
+            if ref.restore_recipe_state or resume_recipe_state:
                 data_consumed = self._read_dataloader(
                     ref.checkpoint_name,
-                    required=require_dataloader_state,
+                    required=require_dataloader_state or resume_recipe_state,
                 )
-                path = self._client.resolve_checkpoint_path(ref.checkpoint_name)
-                logger.info(
-                    "Resuming from explicit same-trainer checkpoint: %s",
+                path = self._client.resolve_checkpoint_path(
                     ref.checkpoint_name,
+                    **(
+                        {"source_job_id": ref.source_job_id}
+                        if ref.source_job_id
+                        else {}
+                    ),
+                )
+                logger.info(
+                    "Resuming recipe from checkpoint %s at dataset cursor %d",
+                    ref.checkpoint_name,
+                    data_consumed,
                 )
                 t0 = time.time()
                 self._client.load_state_with_optimizer(path)
@@ -504,7 +523,11 @@ class TrainingCheckpoints:
                 return ResumeInfo(
                     step=_step_from_name(ref.checkpoint_name),
                     data_consumed=data_consumed,
-                    source_job_id=None if self._serverless else self._trainer_id,
+                    source_job_id=(
+                        None
+                        if self._serverless
+                        else ref.source_job_id or self._trainer_id
+                    ),
                 )
             path = self._client.resolve_checkpoint_path(
                 ref.checkpoint_name,

@@ -26,6 +26,15 @@ _LOOP_STAT_PASSTHROUGH_KEYS = (
     "perf/train_wait_time",
     "perf/wait_time_ratio",
     "perf/train_chunk_wait_time",
+    "perf/train_dispatch_time",
+    "perf/train_worker_time",
+    "perf/train_handoff_time",
+    "perf/train_orchestration_time",
+    "perf/train_worker_thread_cpu_time",
+    "perf/train_worker_process_cpu_time",
+    "perf/train_worker_unphased_time",
+    "perf/train_accounting_error_time",
+    "perf/event_loop_lag_max_time",
 )
 
 _CANONICAL_OPTIMIZER_METRICS = ("grad_norm", "grad_norm_rms", "lr")
