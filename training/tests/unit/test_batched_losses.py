@@ -315,7 +315,7 @@ class TestBuildGRPODatums:
             [0.0, 3.0, 3.0]
         )
 
-    def test_bulk_scalar_extraction_matches_original_float32_bytes(self):
+    def test_vectorized_advantages_match_original_scalar_bytes(self):
         cases = [
             (
                 5.366846413747318,
