@@ -82,6 +82,8 @@ class OptimizerBatch:
     _train_started_at: float | None = None
     _train_finished_at: float | None = None
     _chunk_wait_at_train_start: float = 0.0
+    _train_last_resumed_at: float | None = None
+    _train_timings: dict[str, float] = field(default_factory=dict, repr=False)
 
     @property
     def planned_chunks(self) -> int:

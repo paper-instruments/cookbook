@@ -132,6 +132,39 @@ forced evaluation runs before the coordinator and is the exception. Phase
 metrics can overlap the broad `perf/train_wait_time` remainder, so do not add
 every metric in the table and expect the sum to equal `perf/step_time`.
 
+### Attribute time inside the trainer interval
+
+The batch-native coordinator partitions `perf/train_time` into four wall-time
+totals: `perf/train_dispatch_time` (submission to worker start),
+`perf/train_worker_time` (the callable, including normal return/frame cleanup),
+`perf/train_handoff_time` (worker endpoint to coroutine resumption), and
+`perf/train_orchestration_time` (between calls, excluding later-chunk queue waits).
+`perf/train_accounting_error_time` is the difference from their sum; it should be
+zero apart from floating-point rounding. Handoff includes worker-end logging and
+future delivery, not just event-loop scheduling.
+
+The dedicated `async_rl_loop.py` recipe further splits worker time into
+`perf/{chunk_combine,datum_build,fwd_bwd,postprocess,optim_prepare,optim_step}_time`.
+`fwd_bwd` includes the entire blocking SDK call: serialization, transport,
+backend work, polling/retries, and response decoding. It is **not GPU-only time**.
+`perf/train_worker_unphased_time` is the remaining worker time, including phase-end
+logging, inter-phase gaps and normal return cleanup. Do not add these nested
+phase metrics to the outer worker total.
+
+Each phase and the outer worker also report `_thread_cpu_time` and
+`_process_cpu_time`. Thread CPU isolates the trainer worker; process CPU includes
+concurrent rollout/telemetry threads and may exceed wall time. These counters do
+not alone distinguish GIL contention from other waits. Phase/worker start and
+end logs include monotonic timestamps, batch/chunk or operation IDs, and failure
+status, so a failed step still leaves evidence. Chunk logs count target positions
+from tensor shapes, without scanning or logging token/routing payloads.
+
+An independent 100ms event-loop heartbeat reports
+`perf/event_loop_lag_max_time` (maximum sampled lateness since the last step
+publication) and `producer/event_loop_lag_max_s` (run-wide high water). It keeps
+sampling while the metrics sink is blocked. This diagnoses coordinator stalls,
+not remote latency or GPU utilization; sub-100ms stalls may be missed.
+
 ## Compare producer gauges with optimizer steps
 
 `producer/in_flight_samples` and the capacity gauges use the independent

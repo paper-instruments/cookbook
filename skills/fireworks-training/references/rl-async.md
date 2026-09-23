@@ -34,7 +34,7 @@ Users provide:
 - optional `dynamic_filter_fn` and `evaluation_fn` callbacks.
 
 The recipe owns trainer/deployment lifecycle, rollout fan-out and admission,
-group assembly, advantages, reference and old-policy forwards, GRPO/TIS/KL,
+group assembly, advantages, native CISPO forward/backward,
 training chunks, the optimizer, sampler hotload, version publication, metrics,
 checkpointing, and cleanup.
 
@@ -98,6 +98,14 @@ segment rewards remain unchanged. Evaluation bypasses this training hook.
 The existing `rollout/raw_reward` metric means pre-filter reward; with this
 hook it reports shaped rewards, not the original environment scores.
 
+The dedicated recipe also accepts `advantage_fn(rewards) -> list[float]` in
+`main()`. It receives one reward per surviving run after `reward_transform`
+and returns one advantage per run, before dynamic filtering. The default
+remains `compute_advantages` (group-mean subtraction and group-standard-deviation
+normalization). A custom estimator changes only these advantages, which are
+broadcast to the run's trajectories; native CISPO, masks, routing, chunking,
+and evaluation behavior are unchanged.
+
 `RolloutSetup` contains the tokenizer, tokenizer ID, sampling kwargs, inference
 base URL, API key, deployment model, group size, caller-provided `extras`, and
 the recipe-owned sampling client. The dedicated recipe supplies its managed
@@ -136,7 +144,7 @@ The scheduler is split by one owner per concern:
 | `OptimizerBatch` | One optimizer batch, fixed balanced chunk targets, accepted rows, and the async queue of ready `TrainingChunk`s |
 | `AsyncRLCoordinator` | The producer/batch handoff, one serialized trainer worker, failure boundaries, and publication |
 | `AsyncRLTelemetry` | Rate-limited producer snapshots, completed-batch metric reduction, and reporting |
-| `async_rl_loop.main` | Visible algorithm phases: reference/old-policy forwards, forward/backward, optimizer, hotload, telemetry handoff, and checkpoints |
+| `async_rl_loop.main` | Native CISPO forward/backward, optimizer, hotload, telemetry handoff, and checkpoints |
 
 Blocking trainer calls run on the coordinator's single worker thread. The event
 loop remains free to retire rollout tasks and refill the producer while trainer
@@ -229,7 +237,7 @@ For each optimizer batch:
 1. The first ready chunk exposes the `OptimizerBatch` to the recipe.
 2. `async for chunk in batch.chunks()` waits only for the next predetermined
    chunk. Later chunks can queue while the current chunk trains.
-3. Each chunk runs reference/old-policy work and forward/backward.
+3. Each chunk runs one built-in CISPO forward/backward.
 4. After the final chunk, the recipe performs one optimizer step.
 5. The recipe saves and hotloads sampler weights.
 6. `coordinator.publish(batch)` advances the policy version, commits accepted
@@ -292,7 +300,16 @@ when resume is required. A serverless bare checkpoint name resumes trainer
 state and the dataset cursor for the current run; a dedicated explicit full
 resume uses `<current_job_id>:<checkpoint>`. Dedicated bare/path/cross-job and
 serverless cross-run references restore trainer weights and optimizer state but
-reset the cookbook-owned recipe step and dataset cursor.
+reset the cookbook-owned recipe step and dataset cursor by default. To continue
+a dedicated cross-job `step-N` checkpoint, set `resume_recipe_state=True` and
+provide its matching `dataloader.json` entry in the new `log_path`. Keep the
+dataset, shuffle seed, and total epoch budget unchanged. The dedicated recipe
+persists an immutable cursor plus resolved positions beyond unfinished earlier
+rows, fingerprinted against the ordered dataset and iteration settings. Resume
+skips those resolved positions while retaining every unfinished hole and distinct
+epoch position. Interrupted rollouts and unpublished batches are not restored.
+Legacy integer entries (and the experimental serverless recipe) retain only the
+contiguous prefix, so they may replay already-trained later rows.
 
 ## Metrics and tuning
 
@@ -308,14 +325,26 @@ table.
 
 ## Loss path
 
-The async recipe has one client-side GRPO path; it does not expose a
-`policy_loss` selector. `anchor_logp="old_policy"` snapshots trainer logprobs and
-applies TIS against rollout behavior logprobs. `anchor_logp="rollout"` skips the
-old-policy forward and makes the TIS ratio identity.
+This fork specializes the dedicated async recipe for built-in CISPO. It requires
+`kl_beta=0` and `anchor_logp="rollout"`, rejects reference trainers, and replaces
+PPO/TIS knobs with `cispo_clip_low_threshold=0` and `cispo_clip_high_threshold=5`.
+The numerical `ratio_log_cap=20` is explicit, preserving the previous TIS floor.
+The synchronous and experimental serverless recipes are unchanged.
 
-`TISConfig` controls correction and clipping. Reference KL is enabled when
-`kl_beta > 0`. Raw inference-logprob drift metrics are observational and never
-replace behavior logprobs in PPO or TIS.
+The trainer receives sampled-token logprobs and masked advantages. Prompt, tool,
+and padding positions have zero advantages; original token IDs and R3 routes are
+unchanged. There is no old-policy forward or client-side custom-loss forward.
+One optimizer update still follows all accumulation chunks. Raw inference drift
+is computed from returned training logprobs, without another model call.
+Native loss metrics replace the custom GRPO/PPO diagnostics; their scalar loss
+values are not comparable even when the policy gradients agree.
+
+The old PPO+TIS gradient equals CISPO's gradient when the old-policy and current
+scoring passes agree, with zero KL, matching numerical clamps, and no intervening
+update. This is not a bitwise server-parity claim: repeated-forward numerics and
+floating-point evaluation order can differ. Offline tests cover the local
+objective and request contract; live kernel/R3/normalization parity remains a
+separate qualification.
 
 ## Examples and related references
 

@@ -1,13 +1,18 @@
 # RL loss execution
 
-`training/recipes/rl_loop.py` and `training/recipes/async_rl_loop.py` are
-intentionally opinionated client-side GRPO recipes. They compute
-group-normalized advantages and call `make_grpo_loss_fn(...)` directly through
+`training/recipes/rl_loop.py` is an intentionally opinionated client-side GRPO
+recipe. It computes
+group-normalized advantages and calls `make_grpo_loss_fn(...)` directly through
 `forward_backward_custom(...)`.
 
 There is no loss selector, registry, runtime import, or fallback. The public
 algorithm knobs are `kl_beta`, `eps_clip`, `eps_clip_high`, and `tis`; the
-two recipes also share `anchor_logp="old_policy" | "rollout"`.
+synchronous recipe also exposes `anchor_logp="old_policy" | "rollout"`.
+
+In this fork, `async_rl_loop.py` instead calls built-in `cispo` directly, with
+the rollout anchor and no reference KL. See [its loss contract](rl-async.md#loss-path).
+It does not retain a fallback to custom GRPO. Its callers must use the specialized
+CISPO configuration rather than passing PPO/TIS controls.
 
 ## Default client path
 
@@ -34,7 +39,7 @@ policy.forward_backward_custom(
 This one closure owns PPO clipping, behavioral TIS, and optional reference KL.
 Set `kl_beta=0` to skip reference provisioning.
 
-Both recipes default to `anchor_logp="old_policy"`: snapshot trainer logprobs for the
+The synchronous recipe defaults to `anchor_logp="old_policy"`: snapshot trainer logprobs for the
 PPO anchor and compute TIS against rollout behavior logprobs. Setting
 `anchor_logp="rollout"` skips the snapshot, anchors PPO directly on rollout
 logprobs, and makes the TIS ratio identity.

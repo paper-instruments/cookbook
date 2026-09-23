@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable
@@ -25,6 +26,8 @@ from training.utils.rl.async_rl import (
     RolloutRow,
 )
 from training.utils.rl.async_rl.batch import balanced_chunk_targets
+from training.utils.rl.async_rl import batch as batch_module
+from training.utils.rl.async_rl import coordinator as coordinator_module
 from training.utils.rl.async_rl.telemetry import AsyncRLTelemetry
 from training.utils.rl.rollout import RolloutRun, RolloutSample
 
@@ -664,8 +667,12 @@ def test_producer_filter_observes_transformed_rewards_and_matching_advantages() 
             completions_per_prompt=2,
             prompt_groups_per_step=1,
             training_chunks_per_step=1,
-            reward_transform=lambda _runs, rewards: [r if r < 1 else r - 0.5 for r in rewards],
-            advantage_fn=lambda rewards: [r - sum(rewards) / len(rewards) for r in rewards],
+            reward_transform=lambda _runs, rewards: [
+                r if r < 1 else r - 0.5 for r in rewards
+            ],
+            advantage_fn=lambda rewards: [
+                r - sum(rewards) / len(rewards) for r in rewards
+            ],
             dynamic_filter_fn=accept,
         )
         async with coordinator:
@@ -865,3 +872,265 @@ def test_accepted_cursor_is_not_durable_before_publish() -> None:
             assert resolved == [(0, "accepted"), (1, "accepted")]
 
     _run(scenario())
+
+
+def test_published_row_resolution_is_not_blocked_by_earlier_row() -> None:
+    async def scenario() -> None:
+        first_release = asyncio.Event()
+        resolved: list[tuple[int, str]] = []
+
+        async def first_factory(_sub_index: int) -> None:
+            await first_release.wait()
+            return None
+
+        rows = [
+            _row(
+                0,
+                run_factory=first_factory,
+                on_resolved=lambda reason: resolved.append((0, reason)),
+            ),
+            _row(
+                1,
+                on_resolved=lambda reason: resolved.append((1, reason)),
+            ),
+        ]
+        coordinator = _coordinator(
+            rows,
+            prompt_groups_per_step=1,
+            training_chunks_per_step=1,
+            max_head_off_policy_versions=1,
+        )
+        async with coordinator:
+            batch = await asyncio.wait_for(coordinator.next_batch(), timeout=1.0)
+            assert batch is not None
+            chunks = [chunk async for chunk in batch.chunks()]
+            assert [chunk.source_tokens for chunk in chunks] == [(1,)]
+            assert resolved == []
+
+            published = coordinator.publish(batch)
+
+            assert published.resolved_rows == 0
+            assert resolved == [(1, "accepted")]
+
+            first_release.set()
+            await _wait_until(lambda: coordinator.resolved_rows == 2)
+            assert resolved == [(1, "accepted"), (0, "none")]
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("reason", ["none", "filter"])
+def test_rejected_row_resolution_is_not_blocked_by_earlier_row(reason: str) -> None:
+    async def scenario() -> None:
+        first_release = asyncio.Event()
+        resolved: list[tuple[int, str]] = []
+
+        async def first_factory(_sub_index: int) -> None:
+            await first_release.wait()
+            return None
+
+        async def second_factory(_sub_index: int) -> RolloutRun | None:
+            if reason == "none":
+                return None
+            return _rollout_run(1.0)
+
+        rows = [
+            _row(
+                0,
+                run_factory=first_factory,
+                on_resolved=lambda durable_reason: resolved.append((0, durable_reason)),
+            ),
+            _row(
+                1,
+                run_factory=second_factory,
+                on_resolved=lambda durable_reason: resolved.append((1, durable_reason)),
+            ),
+        ]
+        coordinator = _coordinator(
+            rows,
+            prompt_groups_per_step=1,
+            training_chunks_per_step=1,
+            max_head_off_policy_versions=1,
+            dynamic_filter_fn=(lambda _group: False) if reason == "filter" else None,
+        )
+        async with coordinator:
+            await _wait_until(lambda: coordinator.snapshot()["rows_rejected"] == 1)
+            assert coordinator.resolved_rows == 0
+            assert resolved == [(1, reason)]
+
+            first_release.set()
+            assert await asyncio.wait_for(coordinator.next_batch(), timeout=1.0) is None
+            assert coordinator.resolved_rows == 2
+            assert resolved == [(1, reason), (0, "none")]
+
+    _run(scenario())
+
+
+def test_training_partition_includes_return_teardown_and_excludes_queue_wait(
+    monkeypatch,
+) -> None:
+    clock = SimpleNamespace(wall=100.0, thread=0.0, process=0.0)
+    fake_time = SimpleNamespace(
+        monotonic=lambda: clock.wall,
+        thread_time=lambda: clock.thread,
+        process_time=lambda: clock.process,
+    )
+    monkeypatch.setattr(coordinator_module, "time", fake_time)
+    monkeypatch.setattr(batch_module, "time", fake_time)
+
+    class ReturnTail:
+        def __del__(self):
+            clock.wall += 5
+            clock.thread += 1
+            clock.process += 2
+
+    def train():
+        tail = ReturnTail()
+        clock.wall += 3
+        clock.thread += 3
+        clock.process += 4
+        assert isinstance(tail, ReturnTail)
+
+    async def scenario():
+        telemetry = _telemetry()
+        coordinator = _coordinator(
+            [_row(0)], prompt_groups_per_step=1, training_chunks_per_step=1
+        )
+        async with _observed(coordinator, telemetry):
+            batch = await coordinator.next_batch()
+            assert batch is not None
+            submit, join, get = (
+                coordinator._executor.submit,
+                coordinator._await_joined,
+                batch._queue.get,
+            )
+
+            def delayed_dispatch(call):
+                clock.wall += 2
+                return submit(call)
+
+            async def delayed_handoff(future):
+                result = await join(future)
+                clock.wall += 7
+                return result
+
+            async def queue_wait():
+                item = await get()
+                clock.wall += 5
+                return item
+
+            monkeypatch.setattr(coordinator._executor, "submit", delayed_dispatch)
+            monkeypatch.setattr(coordinator, "_await_joined", delayed_handoff)
+            monkeypatch.setattr(batch._queue, "get", queue_wait)
+            chunks = batch.chunks()
+            await anext(chunks)
+            await coordinator.run_blocking("train_chunk", train, optimizer_batch=batch)
+            clock.wall += 11
+            with pytest.raises(StopAsyncIteration):
+                await anext(chunks)
+            await coordinator.run_blocking(
+                "optimizer", lambda: None, optimizer_batch=batch
+            )
+            published = coordinator.publish(batch)
+            metrics = _finish_step(
+                telemetry,
+                batch,
+                trained_against_version=0,
+                step_time=published.step_time,
+            )
+            assert batch._train_timings == {
+                "dispatch": 4,
+                "worker": 8,
+                "handoff": 14,
+                "orchestration": 16,
+                "worker_thread_cpu": 4,
+                "worker_process_cpu": 6,
+            }
+            assert metrics["perf/train_chunk_wait_time"] == 5
+            assert metrics["perf/train_orchestration_time"] == 11
+            assert metrics["perf/train_time"] == 37
+            assert metrics["perf/train_accounting_error_time"] == 0
+
+    _run(scenario())
+
+
+def test_worker_failure_preserves_error_and_partial_timing(caplog) -> None:
+    caplog.set_level(logging.INFO, logger=coordinator_module.__name__)
+    failure = RuntimeError("native forward failed")
+
+    def fail():
+        raise failure
+
+    async def scenario():
+        async with _coordinator([_row(0)], prompt_groups_per_step=1) as coordinator:
+            batch = await coordinator.next_batch()
+            with pytest.raises(RuntimeError) as caught:
+                await coordinator.run_blocking(
+                    "train_chunk", fail, optimizer_batch=batch
+                )
+            assert caught.value is failure
+            assert set(batch._train_timings) == {
+                "dispatch",
+                "worker",
+                "handoff",
+                "orchestration",
+                "worker_thread_cpu",
+                "worker_process_cpu",
+            }
+            assert batch._train_finished_at is None
+            assert coordinator._active_operation is None
+
+    _run(scenario())
+    assert "Trainer worker end" in caplog.text
+    assert "Trainer operation end" in caplog.text
+    assert "status=error" in caplog.text
+
+
+@pytest.mark.parametrize("cancel_twice", [False, True])
+def test_timing_preserves_worker_join_and_repeated_cancellation(
+    caplog, cancel_twice
+) -> None:
+    caplog.set_level(logging.INFO, logger=coordinator_module.__name__)
+
+    async def scenario():
+        entered, release, finished = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+
+        def train():
+            entered.set()
+            try:
+                assert release.wait(5), "test did not release trainer"
+            finally:
+                finished.set()
+
+        async with _coordinator([_row(0)], prompt_groups_per_step=1) as coordinator:
+            batch = await coordinator.next_batch()
+            task = asyncio.create_task(
+                coordinator.run_blocking("train_chunk", train, optimizer_batch=batch)
+            )
+            try:
+                await _wait_until(entered.is_set)
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                if cancel_twice:
+                    task.cancel()
+                else:
+                    release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert coordinator._active_operation is None
+                if cancel_twice:
+                    assert not finished.is_set()
+                    assert "worker_pending=true" in caplog.text
+                else:
+                    assert finished.is_set()
+                    assert "Trainer operation end" in caplog.text
+            finally:
+                release.set()
+
+    _run(scenario())
+    assert "Trainer worker end" in caplog.text

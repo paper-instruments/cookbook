@@ -244,7 +244,7 @@ class RolloutProducer:
                 raise RuntimeError(
                     f"accepted row {sequence} is not assigned to batch {batch.batch_id}"
                 )
-            entry.durable_reason = "accepted"
+            self._mark_durable(entry, "accepted")
         self._flush_cursor()
         self._published_version = batch.batch_id
         self._next_publish_batch_id += 1
@@ -535,8 +535,8 @@ class RolloutProducer:
             self._pending_completed_rewards.extend(completed_rewards)
         elif completed_rewards:
             self._fill_batch._record_filtered_rewards(completed_rewards)
-        entry.durable_reason = reason
         self._stats.rows_rejected += 1
+        self._mark_durable(entry, reason)
         self._flush_cursor()
 
     def _batch_for_next_group(self) -> OptimizerBatch:
@@ -582,10 +582,15 @@ class RolloutProducer:
             entry = self._cursor.get(self._cursor_flushed)
             if entry is None or entry.durable_reason is None:
                 return
-            if entry.request.on_resolved is not None:
-                entry.request.on_resolved(entry.durable_reason)
             del self._cursor[self._cursor_flushed]
             self._cursor_flushed += 1
+
+    def _mark_durable(self, entry: _CursorEntry, reason: str) -> None:
+        if entry.durable_reason is not None:
+            raise RuntimeError(f"row is already durable as {entry.durable_reason}")
+        entry.durable_reason = reason
+        if entry.request.on_resolved is not None:
+            entry.request.on_resolved(reason)
 
     def _fail(self, error: BaseException) -> None:
         if self._failure is not None or self._closing:

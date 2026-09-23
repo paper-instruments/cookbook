@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import time
 import logging
+import threading
 from copy import deepcopy
 from typing import Any
 from functools import wraps
@@ -133,6 +134,49 @@ def elapsed_timer(name: str):
         yield span
     finally:
         span.elapsed = t.end(name) or 0.0
+
+
+@contextmanager
+def training_phase(name: str, *, batch: int, chunk: int | None = None):
+    """Record bounded async-recipe phase diagnostics, including failed calls."""
+    started = time.monotonic()
+    thread_cpu = time.thread_time()
+    process_cpu = time.process_time()
+    tid = threading.get_native_id()
+    status = "error"
+    logger.info(
+        "Training phase start batch=%s chunk=%s phase=%s tid=%s at=%.9f",
+        batch,
+        chunk,
+        name,
+        tid,
+        started,
+    )
+    try:
+        yield
+        status = "ok"
+    finally:
+        ended = time.monotonic()
+        wall = ended - started
+        thread_cpu = time.thread_time() - thread_cpu
+        process_cpu = time.process_time() - process_cpu
+        timer = Timer()
+        timer.add(name, wall)
+        timer.add(f"{name}_thread_cpu", thread_cpu)
+        timer.add(f"{name}_process_cpu", process_cpu)
+        logger.info(
+            "Training phase end batch=%s chunk=%s phase=%s tid=%s status=%s "
+            "at=%.9f wall=%.6f thread_cpu=%.6f process_cpu=%.6f",
+            batch,
+            chunk,
+            name,
+            tid,
+            status,
+            ended,
+            wall,
+            thread_cpu,
+            process_cpu,
+        )
 
 
 @contextmanager

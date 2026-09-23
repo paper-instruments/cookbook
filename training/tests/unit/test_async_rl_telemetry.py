@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import Callable
 
@@ -154,5 +155,43 @@ def test_metrics_failure_is_not_silent() -> None:
         await _wait_until(lambda: reporter.failure is not None)
         with pytest.raises(OSError, match="ledger unavailable"):
             await reporter.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_loop_lag_sampling_does_not_wait_for_metrics_sink() -> None:
+    async def scenario() -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        records: list[dict] = []
+
+        def blocked_metrics(metrics):
+            entered.set()
+            assert release.wait(timeout=5)
+            records.append(metrics)
+
+        reporter = ProducerMetricsReporter(
+            snapshot_fn=_snapshot,
+            metrics_fn=blocked_metrics,
+            interval_s=10,
+        )
+        reporter.start()
+        try:
+            await _wait_until(entered.is_set)
+            initial_handle = reporter._lag_handle
+            await _wait_until(lambda: reporter._lag_handle is not initial_handle)
+            assert not records
+
+            # Deliver a late heartbeat without sleeping/blocking the test loop.
+            reporter._lag_handle.cancel()
+            reporter._sample_loop_lag(asyncio.get_running_loop().time() - 2)
+            assert reporter.finish_step()["perf/event_loop_lag_max_time"] >= 2
+            assert reporter.finish_step()["perf/event_loop_lag_max_time"] == 0
+            pending_handle = reporter._lag_handle
+        finally:
+            release.set()
+            await reporter.aclose()
+        assert pending_handle.cancelled()
+        assert records[-1]["producer/event_loop_lag_max_s"] >= 2
 
     asyncio.run(scenario())

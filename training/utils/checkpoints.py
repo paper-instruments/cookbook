@@ -5,8 +5,7 @@ two user-facing axes: ``resumable`` and ``promotable``. The control plane
 (``FireworksClient.list_checkpoints(job_id)``) is the source of truth for
 what checkpoints exist, their type, and promotability. The only
 locally-persisted file is ``dataloader.json``, which maps checkpoint name
-to the cookbook's ``data_consumed`` counter (no server-side
-representation).
+to the cookbook's cursor or sparse dataloader state (no server-side representation).
 
 The helpers centralize checkpoint naming and resume metadata handling.
 
@@ -44,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol
 
 import training.utils.fileio as fileio
+from training.utils.dataloader import CursorState
 
 DATALOADER_BASE_NAME = "dataloader.json"
 DATALOADER_HISTORY_KEEP = 20
@@ -53,9 +53,7 @@ _RESUMABLE_TYPE_SUFFIXES = ("TRAINING", "TRAINING_LORA")
 logger = logging.getLogger(__name__)
 
 _URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
-_SERVERLESS_CROSS_RUN_RE = re.compile(
-    r"^[^/]+/run-[0-9a-f]{32}/[^/]+(?:/[^/]+)*$"
-)
+_SERVERLESS_CROSS_RUN_RE = re.compile(r"^[^/]+/run-[0-9a-f]{32}/[^/]+(?:/[^/]+)*$")
 
 
 # -- Public types --------------------------------------------------------------
@@ -69,6 +67,7 @@ class ResumeInfo:
     #: Cumulative raw rows from the source dataset (incl. drops / sample failures), across all runs.
     data_consumed: int = 0
     source_job_id: str | None = None
+    dataloader_state: CursorState | None = None
 
 
 class DataloaderStatePersistenceError(RuntimeError):
@@ -78,7 +77,7 @@ class DataloaderStatePersistenceError(RuntimeError):
 @dataclass(frozen=True)
 class _ResumeCandidate:
     row: dict
-    data_consumed: int | None
+    data_consumed: int | CursorState | None
 
 
 class _CheckpointLister(Protocol):
@@ -317,9 +316,7 @@ def _parse_explicit_checkpoint_ref(
 
     source_job_id, checkpoint_name = spec.split(":", 1)
     if not source_job_id or not checkpoint_name:
-        raise ValueError(
-            "init_from_checkpoint must use '<job_id>:<checkpoint_name>'"
-        )
+        raise ValueError("init_from_checkpoint must use '<job_id>:<checkpoint_name>'")
     return _ExplicitCheckpointRef(
         checkpoint_name,
         None if source_job_id == trainer_id else source_job_id,
@@ -376,6 +373,7 @@ class TrainingCheckpoints:
         resumable: bool,
         promotable: bool,
         data_consumed: int | None = None,
+        dataloader_state: CursorState | None = None,
     ) -> None:
         """Save a checkpoint with the requested capabilities.
 
@@ -388,9 +386,15 @@ class TrainingCheckpoints:
         ``data_consumed`` is persisted to ``dataloader.json`` keyed on
         ``name`` so the corresponding resume call can recover the cookbook's
         rollouts-consumed counter. Ignored when ``resumable=False``.
+        Async callers pass an immutable ``dataloader_state`` snapshot to retain
+        resolved positions beyond the contiguous cursor as well.
         """
         if not (resumable or promotable):
             raise ValueError("save() requires at least one of resumable/promotable")
+        if dataloader_state is not None:
+            if data_consumed is not None and data_consumed != dataloader_state.cursor:
+                raise ValueError("data_consumed disagrees with dataloader_state")
+            data_consumed = dataloader_state.cursor
 
         t0 = time.time()
         if resumable:
@@ -417,7 +421,10 @@ class TrainingCheckpoints:
                     raise DataloaderStatePersistenceError(
                         "Failed to pair saved checkpoint with dataloader state"
                     ) from error
-                self._write_dataloader(actual_name, data_consumed)
+                self._write_dataloader(
+                    actual_name,
+                    dataloader_state if dataloader_state is not None else data_consumed,
+                )
                 if actual_name != name:
                     logger.info(
                         "DCP server-stored name %r differs from caller name %r; "
@@ -463,6 +470,7 @@ class TrainingCheckpoints:
         init_from_checkpoint: str | None = None,
         warm_start_from_adapter: str | None = None,
         require_dataloader_state: bool = False,
+        resume_recipe_state: bool = False,
     ) -> ResumeInfo | None:
         """Determine resume state and load weights into the live client.
 
@@ -472,6 +480,8 @@ class TrainingCheckpoints:
            current-job-qualified ref or serverless current-run ref resumes the
            recipe step/cursor; dedicated bare/path/cross-job and serverless
            cross-run refs restore trainer state but reset the recipe position.
+           ``resume_recipe_state`` explicitly preserves the step and paired local
+           cursor for a dedicated ``step-N`` checkpoint from another job.
         2. Newest resumable row on the control plane — auto-resume.
         3. ``warm_start_from_adapter`` — HF PEFT adapter (weights only).
         4. Fresh start (returns ``None``).
@@ -481,6 +491,8 @@ class TrainingCheckpoints:
             init_from_checkpoint=init_from_checkpoint,
             lora_rank=self._lora_rank,
         )
+        if resume_recipe_state and not init_from_checkpoint:
+            raise ValueError("resume_recipe_state requires init_from_checkpoint")
 
         if init_from_checkpoint:
             ref = _parse_explicit_checkpoint_ref(
@@ -488,15 +500,34 @@ class TrainingCheckpoints:
                 serverless=self._serverless,
                 trainer_id=self._trainer_id,
             )
-            if ref.restore_recipe_state:
+            if resume_recipe_state and not re.fullmatch(
+                r"step-\d+", ref.checkpoint_name
+            ):
+                raise ValueError(
+                    "resume_recipe_state requires a named step-N checkpoint"
+                )
+            if ref.restore_recipe_state or resume_recipe_state:
                 data_consumed = self._read_dataloader(
                     ref.checkpoint_name,
-                    required=require_dataloader_state,
+                    required=require_dataloader_state or resume_recipe_state,
                 )
-                path = self._client.resolve_checkpoint_path(ref.checkpoint_name)
-                logger.info(
-                    "Resuming from explicit same-trainer checkpoint: %s",
+                state = (
+                    data_consumed if isinstance(data_consumed, CursorState) else None
+                )
+                if state is not None:
+                    data_consumed = state.cursor
+                path = self._client.resolve_checkpoint_path(
                     ref.checkpoint_name,
+                    **(
+                        {"source_job_id": ref.source_job_id}
+                        if ref.source_job_id
+                        else {}
+                    ),
+                )
+                logger.info(
+                    "Resuming recipe from checkpoint %s at dataset cursor %d",
+                    ref.checkpoint_name,
+                    data_consumed,
                 )
                 t0 = time.time()
                 self._client.load_state_with_optimizer(path)
@@ -504,7 +535,12 @@ class TrainingCheckpoints:
                 return ResumeInfo(
                     step=_step_from_name(ref.checkpoint_name),
                     data_consumed=data_consumed,
-                    source_job_id=None if self._serverless else self._trainer_id,
+                    source_job_id=(
+                        None
+                        if self._serverless
+                        else ref.source_job_id or self._trainer_id
+                    ),
+                    dataloader_state=state,
                 )
             path = self._client.resolve_checkpoint_path(
                 ref.checkpoint_name,
@@ -534,6 +570,9 @@ class TrainingCheckpoints:
             data_consumed = candidate.data_consumed
             if data_consumed is None:
                 data_consumed = self._read_dataloader(logical)
+            state = data_consumed if isinstance(data_consumed, CursorState) else None
+            if state is not None:
+                data_consumed = state.cursor
             # In serverless mode the pooled multi-session trainer namespaces
             # checkpoints under the current run/session itself and rejects a
             # cross_job://<session_id>/<name> ref (session_id is not a source
@@ -551,6 +590,7 @@ class TrainingCheckpoints:
                 step=_step_from_name(logical),
                 data_consumed=data_consumed,
                 source_job_id=None if self._serverless else self._trainer_id,
+                dataloader_state=state,
             )
 
         if warm_start_from_adapter:
@@ -840,7 +880,9 @@ class TrainingCheckpoints:
     def _dataloader_path(self) -> str:
         return fileio.join(self._log_path, DATALOADER_BASE_NAME)
 
-    def _read_all_dataloader(self, *, required: bool = False) -> dict[str, int]:
+    def _read_all_dataloader(
+        self, *, required: bool = False
+    ) -> dict[str, int | CursorState]:
         path = self._dataloader_path()
         raw = fileio.read_text(path)
         if not raw:
@@ -852,19 +894,24 @@ class TrainingCheckpoints:
                 raise RuntimeError(f"Corrupt dataloader state in {path}: {e}") from e
             logger.warning("Corrupt %s (%s); treating as empty.", path, e)
             return {}
-        invalid = (
-            not isinstance(data, dict)
-            or any(type(value) is not int or value < 0 for value in data.values())
-        )
-        if invalid:
-            error = "expected an object of non-negative integers"
+        try:
+            if not isinstance(data, dict):
+                raise ValueError("expected an object of checkpoint progress records")
+            for name, value in data.items():
+                if isinstance(value, dict):
+                    data[name] = CursorState.from_dict(value)
+                elif type(value) is not int or value < 0:
+                    raise ValueError("expected a non-negative cursor or sparse state")
+        except ValueError as error:
             if required:
-                raise RuntimeError(f"Corrupt dataloader state in {path}: {error}")
+                raise RuntimeError(
+                    f"Corrupt dataloader state in {path}: {error}"
+                ) from error
             logger.warning("Corrupt %s (%s); treating as empty.", path, error)
             return {}
         return data
 
-    def _write_dataloader(self, name: str, data_consumed: int) -> None:
+    def _write_dataloader(self, name: str, data_consumed: int | CursorState) -> None:
         try:
             data = self._read_all_dataloader(required=True)
             data[name] = data_consumed
@@ -872,7 +919,13 @@ class TrainingCheckpoints:
                 ordered = sorted(data.items(), key=lambda kv: _step_from_name(kv[0]))
                 data = dict(ordered[-DATALOADER_HISTORY_KEEP:])
             fileio.makedirs(self._log_path)
-            fileio.write_json(self._dataloader_path(), data)
+            fileio.write_json(
+                self._dataloader_path(),
+                {
+                    key: value.to_dict() if isinstance(value, CursorState) else value
+                    for key, value in data.items()
+                },
+            )
             if self._on_dataloader_saved is not None:
                 self._on_dataloader_saved()
         except DataloaderStatePersistenceError:
@@ -882,7 +935,9 @@ class TrainingCheckpoints:
                 f"Failed to persist dataloader state in {self._dataloader_path()}"
             ) from error
 
-    def _read_dataloader(self, name: str, *, required: bool = False) -> int:
+    def _read_dataloader(
+        self, name: str, *, required: bool = False
+    ) -> int | CursorState:
         data = self._read_all_dataloader(required=required)
         if required and name not in data:
             raise RuntimeError(

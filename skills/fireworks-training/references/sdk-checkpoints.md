@@ -1,10 +1,10 @@
 # Checkpoints — where state lives
 
-The cookbook's checkpoint manager is `TrainingCheckpoints` in `training/utils/checkpoints.py`. The control plane is the source of truth for what checkpoints exist; the only cookbook-side state is `dataloader.json`, which maps each saved checkpoint name to a `data_consumed` counter (one int per row).
+The cookbook's checkpoint manager is `TrainingCheckpoints` in `training/utils/checkpoints.py`. The control plane is the source of truth for what checkpoints exist; cookbook-side `dataloader.json` pairs each saved checkpoint with its data progress.
 
 ## Two axes
 
-`TrainingCheckpoints.save(name, *, resumable, promotable, data_consumed=None)` — pick capabilities independently:
+`TrainingCheckpoints.save(name, *, resumable, promotable, data_consumed=None, dataloader_state=None)` — pick capabilities independently:
 
 - `resumable=True` → DCP write (weights + optimizer). Training can continue from this.
 - `promotable=True` → sampler write (HF safetensors). Eligible for `promote_checkpoint`.
@@ -34,11 +34,27 @@ request-level user error rather than a trainer-wide failure.
 
 ## `dataloader.json`
 
-Written to `{log_path}/dataloader.json`. Single int per checkpoint name:
+Written atomically to `{log_path}/dataloader.json`. Legacy integer entries remain readable:
 
 ```json
 {"step-10": 40, "step-50": 200}
 ```
+
+Dedicated `async_rl_loop` now saves `CursorState` records with `version: 1`,
+`cursor`, `resolved_indices`, and `dataset_fingerprint`. The cursor is the
+contiguous resolved prefix; sorted absolute indices preserve resolved rows beyond
+the first hole. Accepted rows become durable only at optimizer-batch publication;
+filtered/terminally rejected rows become durable on rejection. Prepared but
+unpublished batches are excluded. Each checkpoint gets an immutable snapshot,
+paired with the actual server checkpoint name after the DCP save succeeds.
+
+Resume skips saved indices and regenerates unresolved work. The fingerprint
+checks ordered row contents, total epochs, shuffle, and seed. Callers supplying
+ID-only rows must include immutable dataset revision identity in those rows.
+Epoch-two positions remain distinct, so intentional multi-epoch training is
+unchanged. Legacy integers cannot recover previously lost sparse progress; they
+retain the old conservative, potentially replaying behavior. The experimental
+serverless recipe's manual `resolved_rows_offset` is not an exact-resume ledger.
 
 Bounded to the newest 20 entries. There is no `checkpoints.jsonl` — never has been, in the new model. The control plane (`FireworksClient.list_checkpoints(job_id)`) is queried at resume / promote time for everything else. The async RL recipe resumes from the newest remote DCP row whose logical name is present in this file. A newer unpaired row is skipped, and resume fails closed if remote resumable rows exist but none has cursor metadata.
 
@@ -128,6 +144,17 @@ Cross-job/cross-run DCP initialization restores both weights and optimizer
 state, but resets cookbook-owned step and dataset cursor to 0. Use
 `warm_start_from_adapter` when you specifically want LoRA weights only and a
 fresh optimizer.
+
+For dedicated async RL continuation in a **new** job, explicitly set
+`init_from_checkpoint="<prior_job_id>:step-N"` and `resume_recipe_state=True`.
+Copy that checkpoint's paired entry from the old `dataloader.json` into the new
+`log_path/dataloader.json` before launch. Missing metadata fails before loading
+trainer state; ordinary initialization remains unchanged. Keep the same dataset
+revision/order, shuffle seed, and **total** epoch budget. The restored cursor is
+part of the saved sparse progress record. Copy the whole entry, not just its
+cursor. Sparse records prevent replay of checkpointed rows; speculative work is
+still regenerated. Legacy integer entries retain their replay caveat and need
+independently verified reconstruction if exact task coverage is required.
 
 ---
 

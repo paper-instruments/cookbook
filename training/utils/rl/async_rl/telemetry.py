@@ -119,6 +119,9 @@ class ProducerMetricsReporter:
         self._next_event = 0
         self._failure: BaseException | None = None
         self._step_reducer = ProducerStepMetricsReducer()
+        self._lag_handle: asyncio.TimerHandle | None = None
+        self._loop_lag_max = 0.0
+        self._step_loop_lag_max = 0.0
 
     @property
     def failure(self) -> BaseException | None:
@@ -132,16 +135,23 @@ class ProducerMetricsReporter:
             self._run(),
             name="async-rl-producer-metrics",
         )
+        self._sample_loop_lag(asyncio.get_running_loop().time())
 
     def finish_step(self) -> dict[str, float]:
         if self._task is None:
             raise RuntimeError("producer metrics reporter is not started")
         if self._failure is not None:
             raise self._failure
-        return self._step_reducer.finish_step(self._snapshot_fn())
+        metrics = self._step_reducer.finish_step(self._snapshot_fn())
+        metrics["perf/event_loop_lag_max_time"] = self._step_loop_lag_max
+        self._step_loop_lag_max = 0.0
+        return metrics
 
     async def aclose(self) -> None:
         self._stop.set()
+        if self._lag_handle is not None:
+            self._lag_handle.cancel()
+            self._lag_handle = None
         if self._task is not None:
             await self._task
         if self._failure is not None:
@@ -166,10 +176,20 @@ class ProducerMetricsReporter:
         except BaseException as error:
             self._failure = error
 
+    def _sample_loop_lag(self, expected_at: float) -> None:
+        # Independent of the metrics worker, which can itself be queued or blocked.
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        lag = max(0.0, now - expected_at)
+        self._loop_lag_max = max(self._loop_lag_max, lag)
+        self._step_loop_lag_max = max(self._step_loop_lag_max, lag)
+        self._lag_handle = loop.call_at(now + 0.1, self._sample_loop_lag, now + 0.1)
+
     async def _emit(self, *, force: bool) -> None:
         snapshot = self._snapshot_fn()
         self._step_reducer.observe(snapshot)
         values = producer_metric_values(snapshot)
+        values["producer/event_loop_lag_max_s"] = self._loop_lag_max
         if not force and values == self._last_values:
             return
         metrics: dict[str, Any] = {
@@ -250,6 +270,35 @@ class AsyncRLTelemetry:
         )
         train_time = max(0.0, train_pipeline_time - train_chunk_wait_time)
         train_wait_time = max(0.0, step_time - train_time)
+        operation_metrics = {
+            f"perf/train_{name}_time": value
+            for name, value in batch._train_timings.items()
+        }
+        if batch._train_timings:
+            operation_metrics["perf/train_orchestration_time"] -= train_chunk_wait_time
+            accounted = sum(
+                operation_metrics[f"perf/train_{name}_time"]
+                for name in ("dispatch", "worker", "handoff", "orchestration")
+            )
+            operation_metrics["perf/train_accounting_error_time"] = (
+                train_time - accounted
+            )
+            if "perf/datum_build_time" in timing_metrics:
+                # Includes return/frame cleanup and gaps between the recorded phases.
+                operation_metrics["perf/train_worker_unphased_time"] = (
+                    operation_metrics["perf/train_worker_time"]
+                    - sum(
+                        timing_metrics.get(f"perf/{phase}_time", 0.0)
+                        for phase in (
+                            "chunk_combine",
+                            "datum_build",
+                            "fwd_bwd",
+                            "postprocess",
+                            "optim_prepare",
+                            "optim_step",
+                        )
+                    )
+                )
         loop_stats: dict[str, Any] = {
             "async/version_offset_mean": sum(offsets) / len(offsets),
             "async/version_offset_max": max(offsets),
@@ -264,6 +313,7 @@ class AsyncRLTelemetry:
                 train_wait_time / step_time if step_time > 0 else 0.0
             ),
             "perf/train_chunk_wait_time": train_chunk_wait_time,
+            **operation_metrics,
             **reporter.finish_step(),
         }
         metrics = compute_step_metrics(

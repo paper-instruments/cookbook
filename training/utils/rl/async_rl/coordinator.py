@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
+import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -29,6 +31,7 @@ from training.utils.rl.rollout.group_assembler import AdvantageFn
 from training.utils.rl.rollout.types import RewardTransform
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +77,7 @@ class AsyncRLCoordinator:
         self._closed = False
         self._step_started_at: float | None = None
         self._executor: ThreadPoolExecutor | None = None
+        self._operation_id = 0
         self._producer = RolloutProducer(
             rows=rows,
             output=self._output,
@@ -157,9 +161,10 @@ class AsyncRLCoordinator:
             "train_chunk",
             "optimizer",
         }
+        submitted_at = time.monotonic()
         if tracks_training and optimizer_batch is not None:
             if optimizer_batch._train_started_at is None:
-                optimizer_batch._train_started_at = time.monotonic()
+                optimizer_batch._train_started_at = submitted_at
                 optimizer_batch._chunk_wait_at_train_start = (
                     optimizer_batch._train_chunk_wait_time
                 )
@@ -168,14 +173,102 @@ class AsyncRLCoordinator:
             raise RuntimeError("trainer executor is unavailable")
         self._active_operation = operation
         call = functools.partial(function, *args, **kwargs)
-        worker_future = executor.submit(call)
+        self._operation_id += 1
+        operation_id = self._operation_id
+        batch_id = optimizer_batch.batch_id if optimizer_batch is not None else None
+        worker: dict[str, float] = {}
+
+        def timed_call() -> T:
+            worker["start"] = time.monotonic()
+            cpu = time.thread_time()
+            process_cpu = time.process_time()
+            status = "error"
+            logger.info(
+                "Trainer worker start operation_id=%s batch=%s operation=%s "
+                "tid=%s at=%.9f submitted=%.9f",
+                operation_id,
+                batch_id,
+                operation,
+                threading.get_native_id(),
+                worker["start"],
+                submitted_at,
+            )
+            try:
+                result = call()
+                status = "ok"
+                return result
+            finally:
+                # Outside the callable: includes its normal frame/local teardown.
+                ended_at = time.monotonic()
+                worker["thread_cpu"] = time.thread_time() - cpu
+                worker["process_cpu"] = time.process_time() - process_cpu
+                worker["end"] = ended_at
+                logger.info(
+                    "Trainer worker end operation_id=%s batch=%s operation=%s "
+                    "status=%s at=%.9f thread_cpu=%.6f process_cpu=%.6f",
+                    operation_id,
+                    batch_id,
+                    operation,
+                    status,
+                    worker["end"],
+                    worker["thread_cpu"],
+                    worker["process_cpu"],
+                )
+
+        worker_future = executor.submit(timed_call)
+        status = "error"
         try:
             result = await self._await_joined(worker_future)
-            if optimizer_batch is not None and operation == "optimizer":
-                optimizer_batch._train_finished_at = time.monotonic()
+            status = "ok"
             return result
         finally:
+            resumed_at = time.monotonic()
             self._active_operation = None
+            # Repeated cancellation can interrupt the existing join while the
+            # worker is still running. Diagnostics must not replace cancellation.
+            if "end" in worker:
+                dispatch = worker["start"] - submitted_at
+                elapsed = worker["end"] - worker["start"]
+                handoff = resumed_at - worker["end"]
+                if tracks_training and optimizer_batch is not None:
+                    previous = optimizer_batch._train_last_resumed_at
+                    values = {
+                        "dispatch": dispatch,
+                        "worker": elapsed,
+                        "handoff": handoff,
+                        "orchestration": 0.0
+                        if previous is None
+                        else submitted_at - previous,
+                        "worker_thread_cpu": worker["thread_cpu"],
+                        "worker_process_cpu": worker["process_cpu"],
+                    }
+                    timings = optimizer_batch._train_timings
+                    for name, value in values.items():
+                        timings[name] = timings.get(name, 0.0) + value
+                    optimizer_batch._train_last_resumed_at = resumed_at
+                    if status == "ok" and operation == "optimizer":
+                        optimizer_batch._train_finished_at = resumed_at
+                logger.info(
+                    "Trainer operation end operation_id=%s batch=%s operation=%s "
+                    "status=%s at=%.9f dispatch=%.6f worker=%.6f handoff=%.6f",
+                    operation_id,
+                    batch_id,
+                    operation,
+                    status,
+                    resumed_at,
+                    dispatch,
+                    elapsed,
+                    handoff,
+                )
+            else:
+                logger.info(
+                    "Trainer operation interrupted operation_id=%s batch=%s "
+                    "operation=%s at=%.9f worker_pending=true",
+                    operation_id,
+                    batch_id,
+                    operation,
+                    resumed_at,
+                )
 
     def raise_if_failed(self, batch: OptimizerBatch | None = None) -> None:
         failure = self._producer.failure

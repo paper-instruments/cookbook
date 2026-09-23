@@ -1,8 +1,8 @@
 """Rollout batch types and explicit built-in GRPO datum preparation.
 
-The generic sync and async recipes call ``make_grpo_loss_fn`` directly. Recipe
-forks that intentionally switch to the trainer's built-in PPO kernel can use
-``build_grpo_datums``. There is no registry or runtime loss dispatch here.
+The synchronous recipe calls ``make_grpo_loss_fn`` directly. The specialized
+async CISPO recipe uses ``build_grpo_datums`` with identical behavior-logprob
+inputs, so preparation applies only the token mask. There is no loss dispatch.
 """
 
 from __future__ import annotations
@@ -226,11 +226,11 @@ def build_grpo_datums(
         else:
             tis_weight = torch.ones(resp_len, dtype=torch.float32)
 
+        # Float64 preserves the original Python scalar multiplication/rounding.
         per_token_adv = [0.0] * response_start
-        for r in range(resp_len):
-            per_token_adv.append(
-                float(advantage * tis_weight[r].item() * loss_mask[r].item())
-            )
+        per_token_adv.extend(
+            (advantage * tis_weight.to(torch.float64) * loss_mask).tolist()
+        )
 
         new_datum = tinker.Datum(
             model_input=datum.model_input,
