@@ -303,8 +303,13 @@ serverless cross-run references restore trainer weights and optimizer state but
 reset the cookbook-owned recipe step and dataset cursor by default. To continue
 a dedicated cross-job `step-N` checkpoint, set `resume_recipe_state=True` and
 provide its matching `dataloader.json` entry in the new `log_path`. Keep the
-dataset, shuffle seed, and total epoch budget unchanged. This restores the
-durable prefix, not interrupted rollouts or out-of-order in-memory work.
+dataset, shuffle seed, and total epoch budget unchanged. The dedicated recipe
+persists an immutable cursor plus resolved positions beyond unfinished earlier
+rows, fingerprinted against the ordered dataset and iteration settings. Resume
+skips those resolved positions while retaining every unfinished hole and distinct
+epoch position. Interrupted rollouts and unpublished batches are not restored.
+Legacy integer entries (and the experimental serverless recipe) retain only the
+contiguous prefix, so they may replay already-trained later rows.
 
 ## Metrics and tuning
 

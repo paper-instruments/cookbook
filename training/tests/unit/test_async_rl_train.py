@@ -667,8 +667,12 @@ def test_producer_filter_observes_transformed_rewards_and_matching_advantages() 
             completions_per_prompt=2,
             prompt_groups_per_step=1,
             training_chunks_per_step=1,
-            reward_transform=lambda _runs, rewards: [r if r < 1 else r - 0.5 for r in rewards],
-            advantage_fn=lambda rewards: [r - sum(rewards) / len(rewards) for r in rewards],
+            reward_transform=lambda _runs, rewards: [
+                r if r < 1 else r - 0.5 for r in rewards
+            ],
+            advantage_fn=lambda rewards: [
+                r - sum(rewards) / len(rewards) for r in rewards
+            ],
             dynamic_filter_fn=accept,
         )
         async with coordinator:
@@ -866,6 +870,98 @@ def test_accepted_cursor_is_not_durable_before_publish() -> None:
             published = coordinator.publish(batch)
             assert published.resolved_rows == 2
             assert resolved == [(0, "accepted"), (1, "accepted")]
+
+    _run(scenario())
+
+
+def test_published_row_resolution_is_not_blocked_by_earlier_row() -> None:
+    async def scenario() -> None:
+        first_release = asyncio.Event()
+        resolved: list[tuple[int, str]] = []
+
+        async def first_factory(_sub_index: int) -> None:
+            await first_release.wait()
+            return None
+
+        rows = [
+            _row(
+                0,
+                run_factory=first_factory,
+                on_resolved=lambda reason: resolved.append((0, reason)),
+            ),
+            _row(
+                1,
+                on_resolved=lambda reason: resolved.append((1, reason)),
+            ),
+        ]
+        coordinator = _coordinator(
+            rows,
+            prompt_groups_per_step=1,
+            training_chunks_per_step=1,
+            max_head_off_policy_versions=1,
+        )
+        async with coordinator:
+            batch = await asyncio.wait_for(coordinator.next_batch(), timeout=1.0)
+            assert batch is not None
+            chunks = [chunk async for chunk in batch.chunks()]
+            assert [chunk.source_tokens for chunk in chunks] == [(1,)]
+            assert resolved == []
+
+            published = coordinator.publish(batch)
+
+            assert published.resolved_rows == 0
+            assert resolved == [(1, "accepted")]
+
+            first_release.set()
+            await _wait_until(lambda: coordinator.resolved_rows == 2)
+            assert resolved == [(1, "accepted"), (0, "none")]
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("reason", ["none", "filter"])
+def test_rejected_row_resolution_is_not_blocked_by_earlier_row(reason: str) -> None:
+    async def scenario() -> None:
+        first_release = asyncio.Event()
+        resolved: list[tuple[int, str]] = []
+
+        async def first_factory(_sub_index: int) -> None:
+            await first_release.wait()
+            return None
+
+        async def second_factory(_sub_index: int) -> RolloutRun | None:
+            if reason == "none":
+                return None
+            return _rollout_run(1.0)
+
+        rows = [
+            _row(
+                0,
+                run_factory=first_factory,
+                on_resolved=lambda durable_reason: resolved.append((0, durable_reason)),
+            ),
+            _row(
+                1,
+                run_factory=second_factory,
+                on_resolved=lambda durable_reason: resolved.append((1, durable_reason)),
+            ),
+        ]
+        coordinator = _coordinator(
+            rows,
+            prompt_groups_per_step=1,
+            training_chunks_per_step=1,
+            max_head_off_policy_versions=1,
+            dynamic_filter_fn=(lambda _group: False) if reason == "filter" else None,
+        )
+        async with coordinator:
+            await _wait_until(lambda: coordinator.snapshot()["rows_rejected"] == 1)
+            assert coordinator.resolved_rows == 0
+            assert resolved == [(1, reason)]
+
+            first_release.set()
+            assert await asyncio.wait_for(coordinator.next_batch(), timeout=1.0) is None
+            assert coordinator.resolved_rows == 2
+            assert resolved == [(1, reason), (0, "none")]
 
     _run(scenario())
 

@@ -69,7 +69,7 @@ from training.utils.checkpoints import (
     TrainingCheckpoints,
     validate_warm_start_config,
 )
-from training.utils.dataloader import CursorDataLoader
+from training.utils.dataloader import CursorDataLoader, CursorState
 from training.utils.data import compute_advantages
 from training.utils.logging import ASYNC_RL_WANDB_METRIC_STEPS
 from training.utils.rl.async_rl import (
@@ -272,6 +272,7 @@ def _save_checkpoint(
     *,
     name: str,
     data_consumed: int,
+    dataloader_state: CursorState | None = None,
     resumable: bool = True,
     promotable: bool = False,
 ) -> None:
@@ -282,6 +283,7 @@ def _save_checkpoint(
             resumable=resumable,
             promotable=promotable,
             data_consumed=data_consumed,
+            dataloader_state=dataloader_state,
         )
     logger.info("[%s] dcp_save: done (%.1fs)", name, span.elapsed)
 
@@ -501,9 +503,11 @@ def main(
             epochs=cfg.epochs,
             shuffle=cfg.shuffle,
             seed=cfg.seed,
+            resume_state=resume_info.dataloader_state if resume_info else None,
         )
+        initial_dataloader_state = row_loader.snapshot()
 
-        remaining_rows = max(0, row_loader.total_items - prior_rows_consumed)
+        remaining_rows = row_loader.remaining_items
         total_steps_estimate = step_offset + math.ceil(
             remaining_rows / max(1, cfg.prompt_groups_per_step)
         )
@@ -763,6 +767,7 @@ def main(
                             optimizer_batch=batch,
                         )
                         published = coordinator.publish(batch)
+                        published_dataloader_state = row_loader.snapshot()
 
                         telemetry.finish_step(
                             batch=batch,
@@ -798,6 +803,7 @@ def main(
                                         ckpt,
                                         name=f"step-{batch.batch_id}",
                                         data_consumed=published.resolved_rows,
+                                        dataloader_state=published_dataloader_state,
                                     )
                                 log_metrics(
                                     {
@@ -824,8 +830,9 @@ def main(
         # Save resume progress even if all remaining rows were dropped.
         # Promotion still requires at least one optimizer step.
         resume_row_cursor = int(final_stats["resolved_rows"])
+        final_dataloader_state = row_loader.snapshot()
         has_trained_steps = global_step > step_offset
-        has_advanced_dataset = resume_row_cursor > prior_rows_consumed
+        has_advanced_dataset = final_dataloader_state != initial_dataloader_state
         if cfg.save_final_checkpoint and (has_trained_steps or has_advanced_dataset):
             cp_name = f"step-{global_step}"
             ckpt.save(
@@ -833,6 +840,7 @@ def main(
                 resumable=True,
                 promotable=has_trained_steps,
                 data_consumed=resume_row_cursor,
+                dataloader_state=final_dataloader_state,
             )
             if cfg.output_model_id and has_trained_steps:
                 ckpt.promote_latest(cfg.output_model_id, cfg.base_model)

@@ -7,6 +7,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from training.utils.dataloader import CursorDataLoader
+
 from training.utils.checkpoints import (
     DATALOADER_BASE_NAME,
     DataloaderStatePersistenceError,
@@ -631,6 +633,52 @@ class TestResume:
 
 
 class TestSave:
+    def test_sparse_progress_is_paired_per_checkpoint_without_mutation(self, log_dir):
+        ckpt, client, _ = _make(log_dir)
+        loader = CursorDataLoader(list(range(6)), epochs=2, shuffle=True, seed=7)
+        loader.mark_resolved(1)
+        loader.mark_resolved(3)
+        step5 = loader.snapshot()
+        ckpt.save("step-5", resumable=True, promotable=False, dataloader_state=step5)
+        loader.mark_resolved(4)
+        step6 = loader.snapshot()
+        ckpt.save("step-6", resumable=True, promotable=False, dataloader_state=step6)
+        # Later progress (including partial next-step work) cannot alter either save.
+        loader.mark_resolved(0)
+        for step, state in [(5, step5), (6, step6)]:
+            info = ckpt.resume(
+                init_from_checkpoint=f"previous-job:step-{step}",
+                resume_recipe_state=True,
+                require_dataloader_state=True,
+            )
+            assert info.data_consumed == 0
+            assert info.dataloader_state == state
+            assert info.step == step
+            assert info.source_job_id == "previous-job"
+            client.load_state_with_optimizer.assert_called_with(
+                f"path://previous-job/step-{step}"
+            )
+        assert ckpt.resume(require_dataloader_state=True).dataloader_state == step6
+
+    def test_failed_sparse_checkpoint_cannot_advance_saved_progress(self, log_dir):
+        ckpt, client, _ = _make(log_dir)
+        loader = CursorDataLoader([0, 1, 2])
+        loader.mark_resolved(1)
+        state = loader.snapshot()
+        ckpt.save("step-5", resumable=True, promotable=False, dataloader_state=state)
+        loader.mark_resolved(2)
+        client.save_state.side_effect = RuntimeError("DCP failed")
+        with pytest.raises(RuntimeError, match="DCP failed"):
+            ckpt.save(
+                "step-6",
+                resumable=True,
+                promotable=False,
+                dataloader_state=loader.snapshot(),
+            )
+        info = ckpt.resume(require_dataloader_state=True)
+        assert info.step == 5
+        assert info.dataloader_state == state
+
     def test_resumable_only_writes_dcp_and_dataloader(self, log_dir):
         ckpt, client, fw = _make(log_dir)
         ckpt.save("step-1", resumable=True, promotable=False, data_consumed=100)

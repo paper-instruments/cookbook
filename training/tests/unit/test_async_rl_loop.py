@@ -13,6 +13,7 @@ import tinker
 
 from training.recipes import async_rl_loop
 from training.utils.checkpoints import ResumeInfo
+from training.utils.dataloader import CursorDataLoader
 from training.utils.rl.rollout import RolloutRun, RolloutSample
 
 
@@ -135,7 +136,9 @@ def test_main_rejects_invalid_cispo_config_before_provisioning(
     monkeypatch: pytest.MonkeyPatch, config_overrides, error
 ) -> None:
     cfg = async_rl_loop.Config(log_path="gs://logs", **config_overrides)
-    build_service = MagicMock(side_effect=AssertionError("must fail before provisioning"))
+    build_service = MagicMock(
+        side_effect=AssertionError("must fail before provisioning")
+    )
     monkeypatch.setattr(async_rl_loop, "build_service_client", build_service)
 
     with pytest.raises(ValueError, match=error):
@@ -357,14 +360,15 @@ def test_main_owns_one_managed_sampling_client(
 
 
 @pytest.mark.parametrize(
-    ("custom_advantages", "fail_forward", "continuation"),
+    ("custom_advantages", "fail_forward", "continuation", "sparse_resume"),
     [
-        (False, False, False),
-        (True, False, False),
-        (True, True, False),
-        (True, False, True),
+        (False, False, False, False),
+        (True, False, False, False),
+        (True, True, False, False),
+        (True, False, True, False),
+        (True, False, True, True),
     ],
-    ids=["default", "mean_only", "backend_failure", "continuation"],
+    ids=["default", "mean_only", "backend_failure", "continuation", "sparse_resume"],
 )
 def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
     monkeypatch: pytest.MonkeyPatch,
@@ -373,6 +377,7 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
     custom_advantages: bool,
     fail_forward: bool,
     continuation: bool,
+    sparse_resume: bool,
 ) -> None:
     caplog.set_level("INFO")
     events: list[str] = []
@@ -394,7 +399,9 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         max_context_length=131_072,
     )
     service.create_sampling_client.return_value = sampling_client
-    service.create_reference_client.side_effect = AssertionError("CISPO has no reference")
+    service.create_reference_client.side_effect = AssertionError(
+        "CISPO has no reference"
+    )
     service.hotload_sampler_snapshot.side_effect = lambda path: events.append(
         f"hotload:{path}"
     )
@@ -447,6 +454,12 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         if continuation
         else None
     )
+    rows = [{"id": i} for i in range(3 if continuation and not sparse_resume else 4)]
+    if sparse_resume:
+        prior = CursorDataLoader(rows, start_cursor=2, epochs=2)
+        prior.mark_resolved(3)
+        prior.mark_resolved(6)
+        checkpoints.resume.return_value.dataloader_state = prior.snapshot()
     setup_wandb = MagicMock()
     build_service = MagicMock(return_value=service)
     monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
@@ -501,6 +514,7 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         epochs=2 if continuation else 1,
         init_from_checkpoint="previous-job:step-4" if continuation else None,
         resume_recipe_state=continuation,
+        dcp_save_interval=1,
         save_final_checkpoint=False,
         deployment=async_rl_loop.DeployConfig(tokenizer_model="Qwen/Qwen3-1.7B"),
     )
@@ -512,7 +526,7 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         return [reward - mean_reward for reward in rewards]
 
     kwargs = {
-        "rows": [{"id": i} for i in range(3 if continuation else 4)],
+        "rows": rows,
         "rollout_fn_factory": rollout_factory,
         **({"advantage_fn": mean_centered_advantages} if custom_advantages else {}),
     }
@@ -540,11 +554,19 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         require_dataloader_state=True,
         resume_recipe_state=continuation,
     )
-    assert sorted(sampled_positions) == (
-        [(2, 0)] * 2 + [(3, 1)] * 2 + [(4, 1)] * 2 + [(5, 1)] * 2
+    expected_positions = (
+        [(2, 0), (4, 1), (5, 1), (7, 1)]
+        if sparse_resume
+        else [(2, 0), (3, 1), (4, 1), (5, 1)]
         if continuation
-        else [(i, 0) for i in range(4) for _ in range(2)]
+        else [(i, 0) for i in range(4)]
     )
+    assert sorted(sampled_positions) == [
+        p for p in expected_positions for _ in range(2)
+    ]
+    saved_state = checkpoints.save.call_args.kwargs["dataloader_state"]
+    assert saved_state.cursor == len(rows) * cfg.epochs
+    assert saved_state.resolved_indices == ()
     assert events == [
         f"save:step-{step_offset}",
         f"hotload:step-{step_offset}",
@@ -571,11 +593,13 @@ def test_main_accumulates_native_cispo_chunks_before_one_optimizer_and_hotload(
         assert list(inputs["advantages"].data) == pytest.approx(
             [0, advantage, 0, advantage, advantage]
         )
-    expected_rows = [2, 0, 1, 2] if continuation else list(range(4))
+    expected_rows = [index % len(rows) for index, _epoch in expected_positions]
     assert sorted(
         tuple(datum.loss_fn_inputs["target_tokens"].data[1:3]) for datum in datums_seen
     ) == sorted((20 + row, 30 + sample) for row in expected_rows for sample in range(2))
-    [step_metrics] = [item for item in metrics if "async/realized_training_chunks" in item]
+    [step_metrics] = [
+        item for item in metrics if "async/realized_training_chunks" in item
+    ]
     assert step_metrics["async/realized_training_chunks"] == 4
     phases = (
         "chunk_combine",
@@ -645,8 +669,9 @@ def test_periodic_cursor_persistence_failure_stops_training(
     class _Coordinator:
         global_step = 1
 
-        def __init__(self, **_kwargs):
+        def __init__(self, **kwargs):
             self._batch = _Batch()
+            self._row = next(kwargs["rows"])
 
         async def __aenter__(self):
             return self
@@ -667,6 +692,7 @@ def test_periodic_cursor_persistence_failure_stops_training(
             return None
 
         def publish(self, _batch):
+            self._row.on_resolved("accepted")
             return SimpleNamespace(
                 resolved_rows=1,
                 trained_against_version=0,
@@ -728,7 +754,7 @@ def test_periodic_cursor_persistence_failure_stops_training(
         async_rl_loop.main(
             cfg,
             rows=[{"id": "row-1", "prompt": "1+1"}],
-            rollout_fn_factory=lambda _setup: (lambda _sample: None),
+            rollout_fn_factory=lambda _setup: lambda _sample: None,
         )
 
     assert exc_info.value is persistence_error
@@ -737,6 +763,9 @@ def test_periodic_cursor_persistence_failure_stops_training(
         resumable=True,
         promotable=False,
         data_consumed=1,
+        dataloader_state=CursorDataLoader(
+            [{"id": "row-1", "prompt": "1+1"}], start_cursor=1, shuffle=True
+        ).snapshot(),
     )
     assert events == [
         "telemetry.aclose",
