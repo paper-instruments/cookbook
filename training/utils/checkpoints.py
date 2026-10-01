@@ -75,9 +75,38 @@ class DataloaderStatePersistenceError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class _RecipeProgress:
+    recipe_step: int
+    dataloader_state: int | CursorState
+
+    def to_dict(self) -> dict:
+        return {
+            "version": 2,
+            "recipe_step": self.recipe_step,
+            "dataloader_state": (
+                self.dataloader_state.to_dict()
+                if isinstance(self.dataloader_state, CursorState)
+                else self.dataloader_state
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict) -> _RecipeProgress:
+        step = value.get("recipe_step")
+        state = value.get("dataloader_state")
+        if value.get("version") != 2 or type(step) is not int or step < 0:
+            raise ValueError("invalid recipe step metadata")
+        if isinstance(state, dict):
+            state = CursorState.from_dict(state)
+        elif type(state) is not int or state < 0:
+            raise ValueError("invalid recipe dataloader state")
+        return cls(step, state)
+
+
+@dataclass(frozen=True)
 class _ResumeCandidate:
     row: dict
-    data_consumed: int | CursorState | None
+    data_consumed: int | CursorState | _RecipeProgress | None
 
 
 class _CheckpointLister(Protocol):
@@ -374,6 +403,7 @@ class TrainingCheckpoints:
         promotable: bool,
         data_consumed: int | None = None,
         dataloader_state: CursorState | None = None,
+        recipe_step: int | None = None,
     ) -> None:
         """Save a checkpoint with the requested capabilities.
 
@@ -388,6 +418,8 @@ class TrainingCheckpoints:
         rollouts-consumed counter. Ignored when ``resumable=False``.
         Async callers pass an immutable ``dataloader_state`` snapshot to retain
         resolved positions beyond the contiguous cursor as well.
+        ``recipe_step`` preserves a phase-local step independently of a trainer
+        that renames checkpoints to its cumulative optimizer step.
         """
         if not (resumable or promotable):
             raise ValueError("save() requires at least one of resumable/promotable")
@@ -395,6 +427,13 @@ class TrainingCheckpoints:
             if data_consumed is not None and data_consumed != dataloader_state.cursor:
                 raise ValueError("data_consumed disagrees with dataloader_state")
             data_consumed = dataloader_state.cursor
+        if recipe_step is not None and (
+            type(recipe_step) is not int
+            or recipe_step < 0
+            or not resumable
+            or data_consumed is None
+        ):
+            raise ValueError("recipe_step requires a non-negative int and resumable cursor")
 
         t0 = time.time()
         if resumable:
@@ -424,6 +463,7 @@ class TrainingCheckpoints:
                 self._write_dataloader(
                     actual_name,
                     dataloader_state if dataloader_state is not None else data_consumed,
+                    recipe_step=recipe_step,
                 )
                 if actual_name != name:
                     logger.info(
@@ -511,6 +551,10 @@ class TrainingCheckpoints:
                     ref.checkpoint_name,
                     required=require_dataloader_state or resume_recipe_state,
                 )
+                step = _step_from_name(ref.checkpoint_name)
+                if isinstance(data_consumed, _RecipeProgress):
+                    step = data_consumed.recipe_step
+                    data_consumed = data_consumed.dataloader_state
                 state = (
                     data_consumed if isinstance(data_consumed, CursorState) else None
                 )
@@ -533,7 +577,7 @@ class TrainingCheckpoints:
                 self._client.load_state_with_optimizer(path)
                 logger.info("Checkpoint loaded: %s (%.1fs)", path, time.time() - t0)
                 return ResumeInfo(
-                    step=_step_from_name(ref.checkpoint_name),
+                    step=step,
                     data_consumed=data_consumed,
                     source_job_id=(
                         None
@@ -570,6 +614,10 @@ class TrainingCheckpoints:
             data_consumed = candidate.data_consumed
             if data_consumed is None:
                 data_consumed = self._read_dataloader(logical)
+            step = _step_from_name(logical)
+            if isinstance(data_consumed, _RecipeProgress):
+                step = data_consumed.recipe_step
+                data_consumed = data_consumed.dataloader_state
             state = data_consumed if isinstance(data_consumed, CursorState) else None
             if state is not None:
                 data_consumed = state.cursor
@@ -587,7 +635,7 @@ class TrainingCheckpoints:
             self._client.load_state_with_optimizer(path)
             logger.info("Checkpoint loaded: %s (%.1fs)", path, time.time() - t0)
             return ResumeInfo(
-                step=_step_from_name(logical),
+                step=step,
                 data_consumed=data_consumed,
                 source_job_id=None if self._serverless else self._trainer_id,
                 dataloader_state=state,
@@ -882,7 +930,7 @@ class TrainingCheckpoints:
 
     def _read_all_dataloader(
         self, *, required: bool = False
-    ) -> dict[str, int | CursorState]:
+    ) -> dict[str, int | CursorState | _RecipeProgress]:
         path = self._dataloader_path()
         raw = fileio.read_text(path)
         if not raw:
@@ -894,16 +942,24 @@ class TrainingCheckpoints:
                 raise RuntimeError(f"Corrupt dataloader state in {path}: {e}") from e
             logger.warning("Corrupt %s (%s); treating as empty.", path, e)
             return {}
+        recipe_metadata = isinstance(data, dict) and any(
+            isinstance(value, dict)
+            and ("recipe_step" in value or value.get("version") == 2)
+            for value in data.values()
+        )
         try:
             if not isinstance(data, dict):
                 raise ValueError("expected an object of checkpoint progress records")
             for name, value in data.items():
                 if isinstance(value, dict):
-                    data[name] = CursorState.from_dict(value)
+                    if "recipe_step" in value or value.get("version") == 2:
+                        data[name] = _RecipeProgress.from_dict(value)
+                    else:
+                        data[name] = CursorState.from_dict(value)
                 elif type(value) is not int or value < 0:
                     raise ValueError("expected a non-negative cursor or sparse state")
         except ValueError as error:
-            if required:
+            if required or recipe_metadata:
                 raise RuntimeError(
                     f"Corrupt dataloader state in {path}: {error}"
                 ) from error
@@ -911,10 +967,20 @@ class TrainingCheckpoints:
             return {}
         return data
 
-    def _write_dataloader(self, name: str, data_consumed: int | CursorState) -> None:
+    def _write_dataloader(
+        self,
+        name: str,
+        data_consumed: int | CursorState,
+        *,
+        recipe_step: int | None = None,
+    ) -> None:
         try:
             data = self._read_all_dataloader(required=True)
-            data[name] = data_consumed
+            data[name] = (
+                _RecipeProgress(recipe_step, data_consumed)
+                if recipe_step is not None
+                else data_consumed
+            )
             if len(data) > DATALOADER_HISTORY_KEEP:
                 ordered = sorted(data.items(), key=lambda kv: _step_from_name(kv[0]))
                 data = dict(ordered[-DATALOADER_HISTORY_KEEP:])
@@ -922,7 +988,9 @@ class TrainingCheckpoints:
             fileio.write_json(
                 self._dataloader_path(),
                 {
-                    key: value.to_dict() if isinstance(value, CursorState) else value
+                    key: value.to_dict()
+                    if isinstance(value, (CursorState, _RecipeProgress))
+                    else value
                     for key, value in data.items()
                 },
             )
@@ -937,7 +1005,7 @@ class TrainingCheckpoints:
 
     def _read_dataloader(
         self, name: str, *, required: bool = False
-    ) -> int | CursorState:
+    ) -> int | CursorState | _RecipeProgress:
         data = self._read_all_dataloader(required=required)
         if required and name not in data:
             raise RuntimeError(
