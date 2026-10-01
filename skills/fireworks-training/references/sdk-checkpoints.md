@@ -4,7 +4,7 @@ The cookbook's checkpoint manager is `TrainingCheckpoints` in `training/utils/ch
 
 ## Two axes
 
-`TrainingCheckpoints.save(name, *, resumable, promotable, data_consumed=None, dataloader_state=None)` — pick capabilities independently:
+`TrainingCheckpoints.save(name, *, resumable, promotable, data_consumed=None, dataloader_state=None, recipe_step=None)` — pick capabilities independently:
 
 - `resumable=True` → DCP write (weights + optimizer). Training can continue from this.
 - `promotable=True` → sampler write (HF safetensors). Eligible for `promote_checkpoint`.
@@ -47,6 +47,17 @@ the first hole. Accepted rows become durable only at optimizer-batch publication
 filtered/terminally rejected rows become durable on rejection. Prepared but
 unpublished batches are excluded. Each checkpoint gets an immutable snapshot,
 paired with the actual server checkpoint name after the DCP save succeeds.
+
+When `recipe_step` is supplied, the entry is a version-2 wrapper:
+`{"version": 2, "recipe_step": 1, "dataloader_state": <integer or CursorState>}`.
+The dedicated async recipe opts into this for `max_steps` runs. The phase-local
+step is independent of the remote checkpoint name, which may reflect a trainer's
+cumulative optimizer counter after loading another job's state. Both explicit
+recipe continuation and auto-resume restore this step; ordinary cross-job
+initialization still resets the recipe to zero. Invalid recipe-step metadata
+fails closed before trainer-state loading. Existing integer and version-1 cursor
+entries retain checkpoint-name-derived steps, and saves without `recipe_step`
+retain their original representation. Copy the whole entry when resuming.
 
 Resume skips saved indices and regenerates unresolved work. The fingerprint
 checks ordered row contents, total epochs, shuffle, and seed. Callers supplying

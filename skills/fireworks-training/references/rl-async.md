@@ -247,8 +247,29 @@ The recipe performs an unconditional initial sampler sync and one sync per
 optimizer batch. It has no `weight_sync_interval` or conditional initial-sync
 knob.
 
-When the source ends, the producer seals and trains a final partial optimizer
-batch rather than silently dropping accepted prompt groups.
+By default, when the source ends, the producer seals and trains a final partial
+optimizer batch rather than silently dropping accepted prompt groups.
+
+The dedicated recipe accepts two opt-in controls for bounded phases:
+
+- `max_steps=5` caps the **total phase-local recipe steps**, including restored
+  recipe progress. It is not five additional updates on every restart. Ordinary
+  cross-job DCP initialization still restores weights and optimizer but starts
+  the new phase at step/cursor zero.
+- `require_full_batches=True` waits for a sealed optimizer batch before any
+  forward/backward. An EOF partial batch is discarded without gradients, an
+  optimizer update, publication, or committing its accepted rows. Filtering and
+  refill are unchanged. This opt-in sacrifices within-batch rollout/training
+  overlap; the default chunk-streaming path remains unchanged.
+
+Together these ensure at most five full `prompt_groups_per_step` updates. At
+the limit, speculative rollout tasks are cancelled and joined before final
+evaluation and checkpointing. Unpublished accepted rows remain unresolved.
+The return value includes `steps` and `stop_reason="max_steps_reached"`, or
+`stop_reason="dataset_exhausted_before_max_steps"` with the actual completed
+count when the data cannot supply enough accepted groups. Shortage is a clean
+stop, not a claim that the requested number of updates was reached. Resuming a
+phase already at its limit performs no sampling, evaluation, hotload, or update.
 
 ## Failure policy
 
@@ -295,8 +316,21 @@ durable only after the optimizer step, hotload, and publication succeed. A
 crash during an unfinished batch therefore does not silently advance the
 dataset cursor past uncommitted training data.
 
-`dcp_save_interval=0` disables resumable checkpoints. Set a positive interval
-when resume is required. A serverless bare checkpoint name resumes trainer
+`dcp_save_interval=0` disables periodic resumable checkpoints. Set a positive
+interval when intermediate resume is required. A bounded dedicated run always
+saves a final resumable checkpoint and cursor before returning, even when
+`save_final_checkpoint=False`; any terminal save or cursor-durability failure
+propagates. Nonterminal checkpoint warnings retain their existing semantics.
+A no-op resume already at the bound relies on its existing durable checkpoint.
+
+Bounded runs persist their phase-local `recipe_step` alongside the cursor under
+the **actual remote checkpoint name**. This matters when a trainer renames a
+new phase's `step-1` to its cumulative optimizer `step-22`. Resume uses the
+stored recipe step, not `22`. Legacy entries without recipe-step metadata keep
+their checkpoint-name-based behavior. Copy the entire paired entry for a
+cross-job continuation; do not relabel a checkpoint to infer phase progress.
+
+A serverless bare checkpoint name resumes trainer
 state and the dataset cursor for the current run; a dedicated explicit full
 resume uses `<current_job_id>:<checkpoint>`. Dedicated bare/path/cross-job and
 serverless cross-run references restore trainer weights and optimizer state but

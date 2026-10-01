@@ -36,7 +36,7 @@ import os
 import signal
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import tinker
 from fireworks.training.sdk.training_spec import (
@@ -75,6 +75,7 @@ from training.utils.logging import ASYNC_RL_WANDB_METRIC_STEPS
 from training.utils.rl.async_rl import (
     AsyncRLCoordinator,
     AsyncRLTelemetry,
+    OptimizerBatch,
     TrainingChunk,
     RolloutRow,
 )
@@ -117,6 +118,17 @@ class Config:
     max_completion_tokens: int = 1024
     temperature: float = 1.0
     epochs: int = 1
+    max_steps: int | None = None
+    """Optional total recipe optimizer-step limit, including resumed steps.
+
+    A bounded run always saves its final resumable checkpoint before returning.
+    """
+    require_full_batches: bool = False
+    """Buffer chunks until the batch is full; never train an EOF partial batch.
+
+    Opting in trades within-batch rollout/training overlap for no partial
+    gradient accumulation, including when the trainer is retained on exit.
+    """
     shuffle: bool = True
     seed: int = 0
     max_rows: int = 100
@@ -275,6 +287,7 @@ def _save_checkpoint(
     dataloader_state: CursorState | None = None,
     resumable: bool = True,
     promotable: bool = False,
+    recipe_step: int | None = None,
 ) -> None:
     logger.info("[%s] dcp_save...", name)
     with wall_timer() as span:
@@ -284,6 +297,7 @@ def _save_checkpoint(
             promotable=promotable,
             data_consumed=data_consumed,
             dataloader_state=dataloader_state,
+            **({"recipe_step": recipe_step} if recipe_step is not None else {}),
         )
     logger.info("[%s] dcp_save: done (%.1fs)", name, span.elapsed)
 
@@ -316,6 +330,10 @@ def main(
     Remote trainer and sampler setup is owned by the SDK-managed Tinker path.
     """
     cfg = config
+    if cfg.max_steps is not None and (
+        type(cfg.max_steps) is not int or cfg.max_steps < 1
+    ):
+        raise ValueError("max_steps must be a positive integer or None")
     if evaluation_interval < 1:
         raise ValueError("evaluation_interval must be >= 1")
     if cfg.kl_beta != 0 or cfg.anchor_logp != "rollout":
@@ -385,6 +403,8 @@ def main(
             "max_head_offpolicy_versions": cfg.max_head_offpolicy_versions,
             "max_concurrency_rollout_sample": cfg.max_concurrency_rollout_sample,
             "pipeline_chunks_per_step": cfg.pipeline_chunks_per_step,
+            "max_steps": cfg.max_steps,
+            "require_full_batches": cfg.require_full_batches,
             "max_completion_tokens": cfg.max_completion_tokens,
             "temperature": cfg.temperature,
             "tokenizer_id": cfg.deployment.tokenizer_model,
@@ -482,14 +502,16 @@ def main(
                 step=step_offset,
             )
 
-        with elapsed_timer("weight_sync") as span:
-            saved = policy.save_weights_for_sampler(
-                f"step-{step_offset}",
-                checkpoint_type="base",
-            )
-            service.hotload_sampler_snapshot(saved.path)
-        logger.info("[step %d] initial weight sync (%.1fs)", step_offset, span.elapsed)
-        flush_timing()
+        at_step_limit = cfg.max_steps is not None and step_offset >= cfg.max_steps
+        if not at_step_limit:
+            with elapsed_timer("weight_sync") as span:
+                saved = policy.save_weights_for_sampler(
+                    f"step-{step_offset}",
+                    checkpoint_type="base",
+                )
+                service.hotload_sampler_snapshot(saved.path)
+            logger.info("[step %d] initial weight sync (%.1fs)", step_offset, span.elapsed)
+            flush_timing()
 
         if rows is None:
             rows = load_jsonl_dataset(cfg.dataset, cfg.max_rows)
@@ -506,11 +528,23 @@ def main(
             resume_state=resume_info.dataloader_state if resume_info else None,
         )
         initial_dataloader_state = row_loader.snapshot()
+        if at_step_limit:
+            logger.info("Recipe step limit already reached at step %d", step_offset)
+            wandb_finish(metrics_file=os.environ.get("COOKBOOK_METRICS_FILE"))
+            return {
+                "steps": step_offset,
+                "stop_reason": "max_steps_reached",
+                "policy_job_id": service.trainer_job_id,
+                "reference_job_id": service.reference_trainer_job_id,
+                "deployment_id": service.deployment_id,
+            }
 
         remaining_rows = row_loader.remaining_items
         total_steps_estimate = step_offset + math.ceil(
             remaining_rows / max(1, cfg.prompt_groups_per_step)
         )
+        if cfg.max_steps is not None:
+            total_steps_estimate = min(total_steps_estimate, cfg.max_steps)
 
         logger.info(
             "algorithm=cispo trainer_loss=builtin clip_low=%g clip_high=%g",
@@ -738,7 +772,12 @@ def main(
                     while (batch := await coordinator.next_batch()) is not None:
                         chunk_outputs: list[dict[str, Any]] = []
 
-                        async for chunk in batch.chunks():
+                        chunks = (
+                            _full_batch_chunks(batch)
+                            if cfg.require_full_batches
+                            else batch.chunks()
+                        )
+                        async for chunk in chunks:
                             coordinator.raise_if_failed(batch)
                             output = await coordinator.run_blocking(
                                 "train_chunk",
@@ -750,6 +789,14 @@ def main(
                             chunk_outputs.append(output)
 
                         coordinator.raise_if_failed(batch)
+                        if cfg.require_full_batches and batch.partial:
+                            logger.info(
+                                "Discarding EOF partial batch %d: %d/%d prompt groups",
+                                batch.batch_id,
+                                batch.realized_groups,
+                                batch.target_groups,
+                            )
+                            break
                         optimizer = await coordinator.run_blocking(
                             "optimizer",
                             optimizer_step,
@@ -786,6 +833,8 @@ def main(
                             weight_update_time=sync_wall_time,
                             learning_rate=optimizer["learning_rate"],
                         )
+                        if cfg.max_steps is not None and batch.batch_id >= cfg.max_steps:
+                            break
                         await evaluate(batch.batch_id)
 
                         rollouts_completed = batch.batch_id - step_offset
@@ -804,6 +853,11 @@ def main(
                                         name=f"step-{batch.batch_id}",
                                         data_consumed=published.resolved_rows,
                                         dataloader_state=published_dataloader_state,
+                                        recipe_step=(
+                                            batch.batch_id
+                                            if cfg.max_steps is not None
+                                            else None
+                                        ),
                                     )
                                 log_metrics(
                                     {
@@ -820,6 +874,10 @@ def main(
                                     batch.batch_id,
                                     error,
                                 )
+                    if cfg.max_steps is not None or cfg.require_full_batches:
+                        # Cancel speculative rollouts before evaluation or final
+                        # durability. Unpublished accepted rows stay unresolved.
+                        await coordinator.aclose()
                     await evaluate(coordinator.global_step, force=True)
                 finally:
                     await telemetry.aclose()
@@ -833,7 +891,9 @@ def main(
         final_dataloader_state = row_loader.snapshot()
         has_trained_steps = global_step > step_offset
         has_advanced_dataset = final_dataloader_state != initial_dataloader_state
-        if cfg.save_final_checkpoint and (has_trained_steps or has_advanced_dataset):
+        if cfg.max_steps is not None or (
+            cfg.save_final_checkpoint and (has_trained_steps or has_advanced_dataset)
+        ):
             cp_name = f"step-{global_step}"
             ckpt.save(
                 cp_name,
@@ -841,19 +901,40 @@ def main(
                 promotable=has_trained_steps,
                 data_consumed=resume_row_cursor,
                 dataloader_state=final_dataloader_state,
+                **({"recipe_step": global_step} if cfg.max_steps is not None else {}),
             )
             if cfg.output_model_id and has_trained_steps:
                 ckpt.promote_latest(cfg.output_model_id, cfg.base_model)
 
+        result = {
+            "steps": global_step,
+            "policy_job_id": service.trainer_job_id,
+            "reference_job_id": service.reference_trainer_job_id,
+            "deployment_id": service.deployment_id,
+        }
+        if cfg.max_steps is not None:
+            result["stop_reason"] = (
+                "max_steps_reached"
+                if global_step >= cfg.max_steps
+                else "dataset_exhausted_before_max_steps"
+            )
+            logger.info(
+                "Bounded phase stopped: %s (%d/%d optimizer steps)",
+                result["stop_reason"],
+                global_step,
+                cfg.max_steps,
+            )
         logger.info(
             "Async RL training complete: %d steps (%d new in this run)",
             global_step,
             global_step - step_offset,
         )
         wandb_finish(metrics_file=os.environ.get("COOKBOOK_METRICS_FILE"))
-        return {
-            "steps": global_step,
-            "policy_job_id": service.trainer_job_id,
-            "reference_job_id": service.reference_trainer_job_id,
-            "deployment_id": service.deployment_id,
-        }
+        return result
+
+
+async def _full_batch_chunks(batch: OptimizerBatch) -> AsyncIterator[TrainingChunk]:
+    chunks = [chunk async for chunk in batch.chunks()]
+    if not batch.partial:
+        for chunk in chunks:
+            yield chunk

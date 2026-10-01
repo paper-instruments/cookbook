@@ -156,6 +156,65 @@ class TestValidateWarmStartConfig:
 
 
 class TestResume:
+    @pytest.mark.parametrize("explicit", [False, True])
+    @pytest.mark.parametrize("sparse", [False, True])
+    def test_recipe_step_survives_remote_checkpoint_rename(
+        self, log_dir, explicit, sparse
+    ):
+        ckpt, client, _ = _make(log_dir, save_state_renames_to="step-22")
+        state = (
+            CursorDataLoader(list(range(10)), start_cursor=4).snapshot()
+            if sparse
+            else None
+        )
+        ckpt.save(
+            "step-1",
+            resumable=True,
+            promotable=False,
+            data_consumed=4,
+            dataloader_state=state,
+            recipe_step=1,
+        )
+        info = ckpt.resume(
+            init_from_checkpoint="job-1:step-22" if explicit else None,
+            require_dataloader_state=True,
+        )
+        assert info == ResumeInfo(
+            step=1, data_consumed=4, source_job_id="job-1", dataloader_state=state
+        )
+        client.load_state_with_optimizer.assert_called_once_with("path://self/step-22")
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME)) as file:
+            saved = json.load(file)
+        assert saved["step-22"] == {
+            "version": 2,
+            "recipe_step": 1,
+            "dataloader_state": state.to_dict() if sparse else 4,
+        }
+
+        fresh = ckpt.resume(init_from_checkpoint="previous-job:step-22")
+        assert fresh == ResumeInfo(
+            step=0, data_consumed=0, source_job_id="previous-job"
+        )
+
+    @pytest.mark.parametrize("bad_step", [True, -1, 1.5, "1", None])
+    @pytest.mark.parametrize("required", [False, True])
+    def test_invalid_recipe_metadata_fails_before_loading(
+        self, log_dir, bad_step, required
+    ):
+        with open(os.path.join(log_dir, DATALOADER_BASE_NAME), "w") as file:
+            json.dump(
+                {"step-22": {
+                    "version": 2, "recipe_step": bad_step, "dataloader_state": 4
+                }},
+                file,
+            )
+        ckpt, client, _ = _make(log_dir)
+        with pytest.raises(RuntimeError, match="invalid recipe step metadata"):
+            ckpt.resume(
+                init_from_checkpoint="job-1:step-22", require_dataloader_state=required
+            )
+        client.load_state_with_optimizer.assert_not_called()
+
     def test_fresh_start_when_empty(self, log_dir):
         ckpt, client, _ = _make(log_dir, fw_rows=[])
         assert ckpt.resume() is None
