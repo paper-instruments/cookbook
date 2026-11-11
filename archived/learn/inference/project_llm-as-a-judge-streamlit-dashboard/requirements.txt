@@ -155,7 +155,7 @@ parameterized==0.9.0
 parso==0.8.4
 peewee==3.17.6
 pexpect==4.9.0
-pillow==10.4.0
+pillow==13.0.0
 platformdirs==4.3.6
 posthog==3.6.6
 prettytable==3.11.0
